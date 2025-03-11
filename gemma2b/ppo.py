@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-
 """
-Minimal PPO script with a separate reference model for KL penalty (ReFT style),
-plus logging of the average rollout rewards, and a --data_fraction argument.
-
-Modifications to:
-  - Load "prompt" and "answer_value" from the dataset.
-  - Build a prompt for the policy model that mimics the reference inference style.
-  - Extract numeric carbs from the model's "Output: {\"total_carbohydrates\": X}" line.
-  - Compare with the gold answer_value for the reward.
+PPO script with a separate reference model for KL penalty (ReFT style)
 """
 
 import os
@@ -30,9 +22,9 @@ from transformers import (
     get_constant_schedule_with_warmup
 )
 from accelerate import Accelerator
+import wandb
 
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
-
 
 def set_seed(seed):
     random.seed(seed)
@@ -46,60 +38,59 @@ def set_seed(seed):
 ###############################################################################
 
 accelerator = Accelerator()
-llm_cot_prompt_gemma2 = """<bos><start_of_turn>user
-For the given query including a meal description, think step by step as follows:
-1. Parse the meal description into discrete food or beverage items along with their serving size.
-   If the serving size of any item is not specified, assume it is a single standard serving based on
-   common nutritional guidelines (e.g., USDA). Ignore additional information that doesn’t relate to
-   the item name and serving size.
-2. For each food or beverage item in the meal, calculate the amount of carbohydrates in grams for
-   the specific serving size.
-3. Respond with a dictionary object containing the total carbohydrates in grams as follows:
-{{"total_carbohydrates": total grams of carbohydrates for the serving}}
+llm_cot_prompt_gemma2 = (
+    "<bos><start_of_turn>user\n"
+    "For the given query including a meal description, think step by step as follows:\n"
+    "1. Parse the meal description into discrete food or beverage items along with their serving size. "
+    "If the serving size of any item in the meal is not specified, assume it is a single standard serving "
+    "based on common nutritional guidelines (e.g., USDA). Ignore additional information that doesn't relate "
+    "to the item name and serving size.\n"
+    "2. For each food or beverage item in the meal, calculate the amount of carbohydrates in grams for the "
+    "specific serving size.\n"
+    '3. For the total carbohydrates, respond with just the numeric amount of carbohydrates without extra text. '
+    'If you don\'t know the answer, set the value of "total_carbohydrates" to -1.\n'
+    "4. Respond with a dictionary object containing the total carbohydrates in grams as follows:\n"
+    "{{\"total_carbohydrates\": total grams of carbohydrates for the serving}}\n\n"
+    # Example 1
+    'Query: "This morning, I had a cup of oatmeal with half a sliced banana and a glass of orange juice."\n'
+    "Answer: Let's think step by step.\n"
+    "<cot>\n"
+    "The meal consists of 1 cup of oatmeal, 1/2 a banana and 1 glass of orange juice.\n"
+    "1 cup of oatmeal has 27g carbs.\n"
+    "1 banana has 27g carbs so half a banana has (27*(1/2)) = 13.5g carbs.\n"
+    "1 glass of orange juice has 26g carbs.\n"
+    "So the total grams of carbs in the meal = (27 + 13.5 + 26) = <66.5>g carbs\n"
+    "</cot>\n"
+    '<answer>Output: {{"total_carbohydrates": 66.5}}</answer>\n\n'
 
-For the total carbohydrates, respond with just the numeric amount of carbohydrates without extra text.
-If you don’t know the answer, set the value of "total_carbohydrates" to -1.
+    # Example 2
+    'Query: "I ate scrambled eggs made with 2 eggs and a toast for breakfast."\n'
+    "Answer: Let's think step by step.\n"
+    "<cot>\n"
+    "The meal consists of scrambled eggs made with 2 eggs and 1 toast.\n"
+    "Scrambled eggs made with 2 eggs has 2g carbs.\n"
+    "1 toast has 13g carbs.\n"
+    "So the total grams of carbs in the meal = (2 + 13) = <15>g carbs\n"
+    "</cot>\n"
+    '<answer>Output: {{"total_carbohydrates": 15}}</answer>\n\n'
+    # Example 3
+    'Query: "Half a peanut butter and jelly sandwich."\n'
+    "Answer: Let's think step by step.\n"
+    "<cot>\n"
+    "The meal consists of 1/2 a peanut butter and jelly sandwich.\n"
+    "1 peanut butter and jelly sandwich has 50.6g carbs so half a peanut butter and jelly sandwich "
+    "has (50.6*(1/2)) = <25.3>g carbs\n"
+    "So the total grams of carbs in the meal = <25.3>g carbs\n"
+    "</cot>\n"
+    '<answer>Output: {{"total_carbohydrates": 25.3}}</answer>\n\n'
 
-Follow the format of the following examples when answering:
+    # Placeholder for actual user query
+    'Query: {query}\n'
+    "Answer: Let's think step by step.<end_of_turn>\n"
+    "<start_of_turn>model\n"
+    "<cot>\n"
+)
 
-Query: "This morning, I had a cup of oatmeal with half a sliced banana and a glass of orange juice."
-Answer:
-<cot>
-Let’s think step by step.
-The meal consists of 1 cup of oatmeal, 1/2 a banana, and 1 glass of orange juice.
-1 cup of oatmeal has 27g carbs.
-1 banana has 27g carbs, so half a banana has (27 * 1/2) = 13.5g carbs.
-1 glass of orange juice has 26g carbs.
-So the total grams of carbs in the meal = (27 + 13.5 + 26) = 66.5
-Output: {{"total_carbohydrates": 66.5}}
-</cot>
-<answer>The answer is <66.5></answer>
-Query: "I ate scrambled eggs made with 2 eggs and a toast for breakfast."
-Answer:
-<cot>
-Let’s think step by step.
-The meal consists of scrambled eggs made with 2 eggs and 1 toast.
-Scrambled eggs with 2 eggs has 2g carbs.
-1 toast has 13g carbs.
-So the total grams of carbs in the meal = (2 + 13) = 15
-Output: {{"total_carbohydrates": 15}}
-</cot>
-<answer>The answer is <15></answer>
-
-Query: "Half a peanut butter and jelly sandwich."
-Answer:
-<cot>
-Let’s think step by step.
-The meal consists of 1/2 a peanut butter and jelly sandwich.
-1 peanut butter and jelly sandwich has 50.6g carbs, so half a sandwich is (50.6 * 1/2) = 25.3g carbs.
-So the total grams of carbs in the meal = 25.3
-Output: {{"total_carbohydrates": 25.3}}
-</cot>
-<answer>The answer is <25.3></answer>
-Query: {query}
-Answer:
-<cot>
-"""
 def parse_cot_and_answer(generated_text, user_prompt):
     # (Unused in the main code, but left here if needed)
     half_pb_idx = generated_text.find("Half a peanut butter")
@@ -124,13 +115,20 @@ def parse_cot_and_answer(generated_text, user_prompt):
     return chain_of_thought, final_answer
 
 def extract_carbs_from_answer_block(answer_text: str) -> Optional[float]:
-    # e.g. final answer might look like: "The answer is <26.8>"
-    match = re.search(r"<([\d.]+)>", answer_text)
+    """
+    Extracts the float value associated with "total_carbohydrates"
+    from a string like: Output: {"total_carbohydrates": "2.99"}.
+    Returns the value as a float if found, otherwise None.
+    """
+    accelerator.print(answer_text)
+    # Regex to find something like: "total_carbohydrates": "2.99"
+    pattern = r'"total_carbohydrates":\s*"([\d\.]+)"'
+    match = re.search(pattern, answer_text)
     if match:
         try:
             return float(match.group(1))
         except ValueError:
-            pass
+            return None
     return None
 
 def compare_answer(pred_value: float, true_value: float, margin=7.0):
@@ -254,7 +252,7 @@ def rollout_step(
     return model_input_ids, att_mask, old_logprobs, old_values, reward_tensor, train_mask, reward_list
 
 ###############################################################################
-# 5) PPO STEP with REF MODEL (But not actually used for KL as-is!)
+# 5) PPO STEP with REF MODEL
 ###############################################################################
 def ppo_step(
     model: PolicyValueModel,
@@ -265,7 +263,6 @@ def ppo_step(
     attention_mask,
     reward_tensor,
     train_mask,
-    # Additional args for your kl
     ref_model,
     kl_coef=0.02,
     clip_range=0.2,
@@ -336,7 +333,6 @@ def ppo_step(
     # 5) KL penalty vs reference model
     # ------------------------------------------------------------------
     with torch.no_grad():
-        # Correct reference model forward pass
         ref_out = ref_model(
             input_ids=model_input_ids,
             attention_mask=attention_mask,
@@ -362,7 +358,6 @@ def ppo_step(
     kl_per_token = kl_per_token * valid_mask
     kl_mean = kl_per_token.sum() / mask_sum.clamp_min(1.0)
 
-    # Weighted penalty
     kl_loss = kl_coef * kl_mean
 
     # ------------------------------------------------------------------
@@ -377,8 +372,8 @@ def ppo_step(
     return {
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
-        "kl_value": kl_mean.item(),   # log how big the KL is
-        "kl_loss": kl_loss.item(),    # log the actual added penalty
+        "kl_value": kl_mean.item(),
+        "kl_loss": kl_loss.item(),
         "total_loss": total_loss.item(),
     }
 
@@ -401,9 +396,23 @@ def main():
     parser.add_argument("--ppo_epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_fraction", type=float, default=1.0)
+    # <<< W&B: Optional arguments for W&B
+    parser.add_argument("--wandb_project", type=str, default=None,
+                        help="W&B project name to log metrics to.")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity (username or team).")
     args = parser.parse_args()
 
     set_seed(args.seed + accelerator.process_index)
+
+    if accelerator.is_main_process and args.wandb_project is not None:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            config=vars(args),
+        )
+        # Optionally watch gradients/params if desired:
+        # wandb.watch(models=policy_value_model, log="all")
 
     # --------------------------------------------------------------------------
     # A) Load data
@@ -431,7 +440,7 @@ def main():
     accelerator.print(f"Loading base model {args.base_model_name}")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_name,
-        device_map="auto"  # Might conflict w/ accelerate on some setups
+        device_map="auto"
     )
     if args.peft_checkpoint:
         accelerator.print(f"Loading PEFT from {args.peft_checkpoint}")
@@ -446,7 +455,6 @@ def main():
     if args.peft_checkpoint:
         ref_base_model = PeftModel.from_pretrained(ref_base_model, args.peft_checkpoint)
 
-    # Freeze the reference model's parameters
     for param in ref_base_model.parameters():
         param.requires_grad = False
 
@@ -486,13 +494,15 @@ def main():
             prompts = [llm_cot_prompt_gemma2.format(query=q) for q in batch_q]
 
             # Rollout
-            (model_input_ids,
-             attention_mask,
-             old_logprobs,
-             old_values,
-             reward_tensor,
-             train_mask,
-             reward_list) = rollout_step(
+            (
+                model_input_ids,
+                attention_mask,
+                old_logprobs,
+                old_values,
+                reward_tensor,
+                train_mask,
+                reward_list
+            ) = rollout_step(
                 policy_value_model,
                 tokenizer,
                 prompts,
@@ -523,7 +533,7 @@ def main():
             global_step += 1
 
             # Save model checkpoint periodically
-            if global_step % 10 == 0:
+            if global_step % 100 == 0:
                 accelerator.print(f"Saving model checkpoint at step {global_step}")
                 unwrapped_policy_value = accelerator.unwrap_model(policy_value_model)
                 checkpoint_dir = f"ppo_out/checkpoint_{global_step}"
@@ -531,7 +541,20 @@ def main():
                 unwrapped_policy_value.base_model.save_pretrained(checkpoint_dir)
                 tokenizer.save_pretrained(checkpoint_dir)
 
-            if global_step % 1 == 0:
+            if accelerator.is_main_process:
+                wandb_dict = {
+                    "train/epoch": epoch,
+                    "train/step": global_step,
+                    "train/avg_reward": avg_reward,
+                    "train/policy_loss": stats["policy_loss"],
+                    "train/value_loss": stats["value_loss"],
+                    "train/kl_value": stats["kl_value"],
+                    "train/kl_loss": stats["kl_loss"],
+                    "train/total_loss": stats["total_loss"],
+                }
+                wandb.log(wandb_dict, step=global_step)
+
+            if global_step % 10 == 0:
                 accelerator.print(
                     f"Epoch={epoch}, step={global_step}, "
                     f"avg_reward={avg_reward:.3f}, stats={stats}"

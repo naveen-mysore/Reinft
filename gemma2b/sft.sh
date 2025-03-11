@@ -1,0 +1,1 @@
+accelerate launch --num_processes=4 sft.py --epochs 4 --model_name google/gemma-2-2b-it

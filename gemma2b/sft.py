@@ -1,3 +1,4 @@
+import os
 import json
 import torch
 import argparse
@@ -8,6 +9,14 @@ from trl import SFTConfig, SFTTrainer
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+
+########################################################
+# Force “eager” attention (math-based) in PyTorch 2.0. #
+########################################################
+if torch.cuda.is_available():
+    # Either pick sdp_kernel = "math" directly:
+    torch.backends.cuda.sdp_kernel = "math"
+
 
 llm_cot_prompt_gemma2 = (
     "<bos><start_of_turn>user\n"
@@ -74,7 +83,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="fine_tuned_model")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--batch_size", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=4)
     return parser.parse_args()
 
 def load_json_as_hf_dataset(file_path):
