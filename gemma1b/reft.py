@@ -3,6 +3,9 @@
 ReFT PPO script for Gemma 3 1B (text-only),
 using Option 2: Keep a separate reference to the base LM unwrapped,
 so we can call raw_lm.generate(...) even after DDP wrapping policy_value_model.
+
+MAE/testing code has been removed. You can compute MAE in a separate script
+using the final PPO-trained model checkpoint.
 """
 
 import os
@@ -29,7 +32,6 @@ from transformers import (
 )
 
 from prompt_manager import PromptManager
-
 
 ###############################################################################
 # 1) PPO REWARD + ADVANTAGE UTILS
@@ -107,11 +109,11 @@ class PolicyValueModel(nn.Module):
 
 
 ###############################################################################
-# 3) ROLLOUT STEP (Multi-token generation) using "raw_lm"   (★)
+# 3) ROLLOUT STEP
 ###############################################################################
 def rollout_step(
         policy_value_model: PolicyValueModel,
-        raw_lm,                          # (★) pass the unwrapped LM for .generate()
+        raw_lm,
         tokenizer,
         prompts,
         true_values,
@@ -180,7 +182,7 @@ def rollout_step(
         reward_val = numeric_reward + structure_reward
         reward_list.append(reward_val)
 
-    # --- 3) Re-encode the entire text to compute logprobs + values from the policy_value_model (DDP) ---
+    # --- 3) Re-encode to compute logprobs + values from policy_value_model (DDP) ---
     enc_full = tokenizer(final_texts, return_tensors="pt", padding=True, truncation=True)
     full_input_ids = enc_full["input_ids"].to(device)
     full_attention_mask = enc_full["attention_mask"].to(device)
@@ -297,69 +299,7 @@ def ppo_step(
 
 
 ###############################################################################
-# 5) EVAL  (★) Also call raw_lm.generate instead of DDP, for consistency
-###############################################################################
-def evaluate_on_test_set(
-        policy_value_model,
-        raw_lm,  # unwrapped LM
-        tokenizer,
-        test_data,
-        prompt_manager,
-        batch_size=4,
-        accelerator=None
-):
-    """
-    Evaluate by generating from raw_lm, then parse the final text for carbs.
-    """
-    device = next(policy_value_model.parameters()).device
-    policy_value_model.eval()
-    raw_lm.eval()
-
-    mae_list = []
-    idx = 0
-    while idx < len(test_data):
-        subset = test_data[idx: idx + batch_size]
-        idx += batch_size
-        questions = [item["question"] for item in subset]
-        true_vals = [float(item["answer_value"]) for item in subset]
-
-        # Use inference prompt for consistency
-        inference_prompts = [prompt_manager.build_inference_prompt(q) for q in questions]
-        enc = tokenizer(inference_prompts, return_tensors="pt", padding=True, truncation=True)
-        input_ids = enc["input_ids"].to(device)
-        attn_mask = enc["attention_mask"].to(device)
-
-        with torch.no_grad():
-            # multi-token generation using raw_lm
-            outputs = raw_lm.generate(
-                input_ids=input_ids,
-                attention_mask=attn_mask,
-                max_new_tokens=50,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=False
-            )
-
-        gen_texts = [tokenizer.decode(seq, skip_special_tokens=False) for seq in outputs]
-
-        for i, text in enumerate(gen_texts):
-            chain_of_thought, final_ans = prompt_manager.parse_cot_and_answer(
-                text,
-                verbose=False
-            )
-            guess = prompt_manager.extract_carbs_from_answer(final_ans)
-            if guess is not None:
-                mae_list.append(abs(guess - true_vals[i]))
-
-    policy_value_model.train()
-    raw_lm.train()
-    if len(mae_list) == 0:
-        return None
-    return sum(mae_list) / len(mae_list)
-
-
-###############################################################################
-# 6) MAIN
+# 5) MAIN
 ###############################################################################
 def main():
     import argparse
@@ -367,7 +307,6 @@ def main():
     parser.add_argument("--warm_start_model", type=str, default="fine_tuned_model",
                         help="Path to your *fine-tuned* model checkpoint.")
     parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--test_file", type=str, default=None)
     parser.add_argument("--kl_coef", type=float, default=0.01)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--n_epochs", type=int, default=1)
@@ -411,16 +350,11 @@ def main():
         keep_sz = int(len(dataset) * args.data_fraction)
         dataset = dataset[:keep_sz]
 
-    test_data = None
-    if args.test_file:
-        with open(args.test_file, "r") as f:
-            test_data = json.load(f)
-        accelerator.print(f"Loaded test data, size={len(test_data)}")
-
     accelerator.print(f"Loaded {len(dataset)} training samples from {args.train_file}")
 
-    # 2) (★) Load your fine-tuned model as raw_lm. Keep it unwrapped for .generate() calls
+    # 2) Load raw model for generation
     accelerator.print(f"Loading raw_lm from {args.warm_start_model}")
+    from transformers import AutoConfig, Gemma3ForCausalLM
     config = AutoConfig.from_pretrained(args.warm_start_model, trust_remote_code=True)
     if hasattr(config, "vision_config"):
         del config.vision_config
@@ -446,18 +380,19 @@ def main():
     for p in ref_base.parameters():
         p.requires_grad = False
 
-    # 3) Build policy-value model from raw_lm, but do not alter raw_lm for .generate
+    # 3) Build policy-value model from raw_lm
     policy_value_model = PolicyValueModel(raw_lm)
     policy_value_model.to(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32)
 
     # 4) Load tokenizer
+    from transformers import AutoTokenizer
     accelerator.print("Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(args.warm_start_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    # (★) Wrap policy_value_model + ref_base in DDP, but NOT raw_lm
+    # Wrap for DDP
     policy_value_model, ref_base = accelerator.prepare(policy_value_model, ref_base)
 
     # 5) optimizer
@@ -467,7 +402,7 @@ def main():
     global_step = 0
     reward_deque = deque(maxlen=100)
 
-    # Initialize PromptManager once
+    # Initialize PromptManager
     prompt_manager = PromptManager()
 
     # 6) PPO
@@ -482,7 +417,7 @@ def main():
             b_q = [x[0] for x in batch_slice]
             b_a = [x[1] for x in batch_slice]
 
-            # multi-step rollout with raw_lm for generation
+            # rollout
             (new_input_ids,
              new_attn_mask,
              old_logprobs,
@@ -491,7 +426,7 @@ def main():
              train_mask,
              reward_list) = rollout_step(
                 policy_value_model,
-                raw_lm,                 # (★) pass the unwrapped model
+                raw_lm,
                 tokenizer,
                 b_q,
                 b_a,
@@ -507,7 +442,8 @@ def main():
             rolling_avg = sum(reward_deque) / len(reward_deque)
 
             advantages, returns_ = compute_gae_advantages(reward_tensor, old_values)
-            # multiple PPO update epochs on the same data
+
+            # multiple PPO epochs
             last_loss_dict = None
             for _ in range(ppo_epochs):
                 loss_dict = ppo_step(
@@ -530,7 +466,9 @@ def main():
                 last_loss_dict = loss_dict
             global_step += 1
 
-            # logging
+            accelerator.wait_for_everyone()
+
+            # Logging
             if accelerator.is_main_process and wandb.run and last_loss_dict is not None:
                 wandb.log({
                     "train/epoch": ep,
@@ -544,48 +482,27 @@ def main():
                     "train/total_loss": last_loss_dict["total_loss"]
                 }, step=global_step)
 
-            if test_data and accelerator.is_main_process and (global_step % 50 == 0):
-                quick_mae = evaluate_on_test_set(
-                    policy_value_model,
-                    raw_lm,            # pass raw_lm for generation in eval
-                    tokenizer,
-                    test_data,
-                    prompt_manager,
-                    batch_size=args.batch_size,
-                    accelerator=accelerator
-                )
-                if quick_mae is not None and wandb.run:
-                    wandb.log({"test/quick_mae": quick_mae}, step=global_step)
-                accelerator.print(f"[Step={global_step}] Rolling avg={rolling_avg:.3f}, quick mae={quick_mae}")
-
+            # Optional checkpoint saving
             if global_step % 200 == 0:
-                accelerator.print(f"Saving checkpoint at step={global_step}")
-                unwrap = accelerator.unwrap_model(policy_value_model)
-                ckdir = f"ppo_out/checkpoint_{global_step}"
-                unwrap.base_model.save_pretrained(ckdir)
-                tokenizer.save_pretrained(ckdir)
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    accelerator.print(f"Saving checkpoint at step={global_step}")
+                    unwrap = accelerator.unwrap_model(policy_value_model)
+                    ckdir = f"ppo_out/checkpoint_{global_step}"
+                    unwrap.base_model.save_pretrained(ckdir)
+                    tokenizer.save_pretrained(ckdir)
+                accelerator.wait_for_everyone()
 
-        # end of epoch
-        if test_data and accelerator.is_main_process:
-            mae = evaluate_on_test_set(
-                policy_value_model,
-                raw_lm,
-                tokenizer,
-                test_data,
-                prompt_manager,
-                batch_size=args.batch_size,
-                accelerator=accelerator
-            )
-            if mae and wandb.run:
-                wandb.log({"test/mae": mae}, step=global_step)
-            accelerator.print(f"Epoch={ep}, test mae={mae}")
+        accelerator.print(f"Epoch={ep} completed. Rolling avg reward={rolling_avg:.3f}")
 
     accelerator.print("Done PPO training!")
     accelerator.wait_for_everyone()
-    final_unwrap = accelerator.unwrap_model(policy_value_model)
-    final_unwrap.base_model.save_pretrained("ppo_trained_model")
-    tokenizer.save_pretrained("ppo_trained_model")
-    torch.save(final_unwrap.state_dict(), "ppo_policy_value_model.pt")
+
+    if accelerator.is_main_process:
+        final_unwrap = accelerator.unwrap_model(policy_value_model)
+        final_unwrap.base_model.save_pretrained("ppo_trained_model")
+        tokenizer.save_pretrained("ppo_trained_model")
+        torch.save(final_unwrap.state_dict(), "ppo_policy_value_model.pt")
 
 
 if __name__ == "__main__":
