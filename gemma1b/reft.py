@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 ReFT PPO script for Gemma 3 1B (text-only),
-updated to use a PromptManager class for prompt creation.
+using Option 2: Keep a separate reference to the base LM unwrapped,
+so we can call raw_lm.generate(...) even after DDP wrapping policy_value_model.
 """
 
 import os
@@ -42,10 +43,8 @@ def compute_logprobs_from_logits(logits, labels):
 
 def scaled_reward(pred_value: float, true_value: float, threshold=5.0, accelerator=None):
     """
-    A simple reward function that gives up to 1.0 if difference < threshold,
-    else 0. Example:
-      - difference < threshold => reward in [0..1]
-      - difference >= threshold => reward = 0.0
+    A simple numeric reward function for how close 'pred_value' is to 'true_value',
+    giving up to 1.0 if within 'threshold', else 0.0
     """
     if accelerator:
         accelerator.print(f"Pred={pred_value}, True={true_value}")
@@ -53,6 +52,7 @@ def scaled_reward(pred_value: float, true_value: float, threshold=5.0, accelerat
     if diff >= threshold:
         return 0.0
     else:
+        # linear scale from 1.0 down to 0.0 as diff goes 0..threshold
         return 1.0 - (diff / threshold)
 
 
@@ -101,160 +101,110 @@ class PolicyValueModel(nn.Module):
 
 
 ###############################################################################
-# 3) ROLLOUT STEP (multi-token generation)
+# 3) ROLLOUT STEP (Multi-token generation) using "raw_lm"   (★)
 ###############################################################################
 def rollout_step(
         policy_value_model: PolicyValueModel,
+        raw_lm,                          # (★) pass the unwrapped LM for .generate()
         tokenizer,
         prompts,
         true_values,
         prompt_manager,
-        max_new_tokens=1,
+        max_new_tokens=200,
         accelerator=None,
-        temperature=1.3
+        temperature=1.0,
+        do_sample=False
 ):
     """
-    Multi-step sampling up to `max_new_tokens` for each prompt.
-    We'll create final sequences and compute rewards from them.
+    Generate text with the same prompt style as inference (so <cot> and <answer> appear),
+    then parse and compute rewards. Use raw_lm for .generate() to avoid DDP issues.
     """
     device = next(policy_value_model.parameters()).device
     batch_size = len(prompts)
 
-    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    # Build inference prompts
+    inference_prompts = [prompt_manager.build_prompt(p) for p in prompts]
+    enc = tokenizer(inference_prompts, return_tensors="pt", padding=True, truncation=True)
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
 
-    ended = [False] * batch_size
-    eos_token_id = tokenizer.eos_token_id or -100
+    # --- 1) Generate final sequences with raw_lm ---
+    raw_lm.eval()
+    with torch.no_grad():
+        outputs = raw_lm.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=False
+        )
+    raw_lm.train()
 
-    # sampling loop
-    for _ in range(max_new_tokens):
-        policy_value_model.eval()
-        with torch.no_grad():
-            lm_logits, values = policy_value_model(input_ids, attention_mask)
-        policy_value_model.train()
+    # decode preserving special tokens
+    final_texts = [
+        tokenizer.decode(seq, skip_special_tokens=False)
+        for seq in outputs
+    ]
 
-        seq_lens = attention_mask.sum(dim=1)
-        last_logits_list = []
-        for i in range(batch_size):
-            pos = seq_lens[i].item() - 1
-            last_logits_list.append(lm_logits[i, pos, :].unsqueeze(0))
-        last_logits = torch.cat(last_logits_list, dim=0)  # [B, vocab]
-
-        scaled_logits = last_logits / temperature
-        probs = F.softmax(scaled_logits, dim=-1)
-        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        next_tokens = next_tokens.cpu()
-        for i in range(batch_size):
-            if ended[i]:
-                next_tokens[i] = tokenizer.pad_token_id or eos_token_id
-
-        new_input_ids = []
-        new_attn_mask = []
-        for i in range(batch_size):
-            seq_i = input_ids[i].tolist()
-            mask_i = attention_mask[i].tolist()
-            if not ended[i]:
-                seq_i.append(next_tokens[i].item())
-                mask_i.append(1)
-                if next_tokens[i].item() == eos_token_id:
-                    ended[i] = True
-            else:
-                seq_i.append(tokenizer.pad_token_id)
-                mask_i.append(0)
-            new_input_ids.append(seq_i)
-            new_attn_mask.append(mask_i)
-
-        max_len = max(len(s) for s in new_input_ids)
-        padded_input_ids = []
-        padded_attn_mask = []
-        for i in range(batch_size):
-            needed = max_len - len(new_input_ids[i])
-            padded_input_ids.append(new_input_ids[i] + [tokenizer.pad_token_id] * needed)
-            padded_attn_mask.append(new_attn_mask[i] + [0] * needed)
-
-        input_ids = torch.tensor(padded_input_ids, device=device)
-        attention_mask = torch.tensor(padded_attn_mask, device=device)
-
-        if all(ended):
-            break
-
-    # decode final
-    final_texts = []
-    seq_lens = attention_mask.sum(dim=1)
-    for i in range(batch_size):
-        seq_i = input_ids[i, :seq_lens[i]].cpu().tolist()
-        txt = tokenizer.decode(seq_i, skip_special_tokens=True)
-        final_texts.append(txt)
-
-    # compute reward
+    # --- 2) Parse for <cot> and <answer>, compute reward ---
     reward_list = []
     for i, text in enumerate(final_texts):
-        # --------------------------------------------------
-        # 1) Check for correct structure
-        #    We want something like: <cot>...</cot> then <answer>Output: {...}</answer>
-        #    This can be done with a quick substring check or a small pattern check.
-        # --------------------------------------------------
         has_cot = ("<cot>" in text) and ("</cot>" in text)
         has_answer = ("<answer>" in text) and ("</answer>" in text)
-
-        # optionally, you can further check that the <answer> block
-        # includes "Output: {\"total_carbohydrates\":"
         has_output_dict = False
-        if has_answer:
-            # a quick check for the "Output: {" substring
-            if "Output: {\"total_carbohydrates\":" in text:
-                has_output_dict = True
-
-        # We'll say: if both <cot>...</cot> and <answer>Output: {...}</answer> exist,
-        # that structure is considered correct.
+        if has_answer and "Output: {\"total_carbohydrates\":" in text:
+            has_output_dict = True
         correct_structure = has_cot and has_answer and has_output_dict
-
-        # partial reward, say 0.2, purely for correct structure
         structure_reward = 0.2 if correct_structure else 0.0
 
-        chain_of_thought, final_answer = prompt_manager.parse_cot_and_answer(
-            text, 
+        chain_of_thought, final_ans = prompt_manager.parse_cot_and_answer(
+            text,
             verbose=accelerator is not None,
             log_fn=accelerator.print if accelerator else None
         )
-        guess = prompt_manager.extract_carbs_from_answer(final_answer)
+        guess = prompt_manager.extract_carbs_from_answer(final_ans)
         if guess is not None:
             numeric_reward = scaled_reward(guess, true_values[i], threshold=20.0, accelerator=accelerator)
         else:
             numeric_reward = -1.0
 
         reward_val = numeric_reward + structure_reward
-
         reward_list.append(reward_val)
 
-    # final old_logprobs + values
+    # --- 3) Re-encode the entire text to compute logprobs + values from the policy_value_model (DDP) ---
+    enc_full = tokenizer(final_texts, return_tensors="pt", padding=True, truncation=True)
+    full_input_ids = enc_full["input_ids"].to(device)
+    full_attention_mask = enc_full["attention_mask"].to(device)
+
     with torch.no_grad():
-        lm_logits_final, values_final = policy_value_model(input_ids, attention_mask)
-    old_logprobs = compute_logprobs_from_logits(lm_logits_final[:, :-1, :], input_ids[:, 1:])
-    batch_size, seq_len = old_logprobs.shape
-    padcol = torch.zeros((batch_size, 1), device=device)
+        lm_logits_full, values_full = policy_value_model(full_input_ids, full_attention_mask)
+
+    old_logprobs = compute_logprobs_from_logits(lm_logits_full[:, :-1, :], full_input_ids[:, 1:])
+    padcol = torch.zeros((old_logprobs.size(0), 1), device=device)
     old_logprobs = torch.cat([old_logprobs, padcol], dim=1)
 
-    reward_tensor = torch.zeros_like(values_final)
-    for i in range(batch_size):
-        s_len = int(seq_lens[i].item())
-        reward_tensor[i, s_len - 1] = reward_list[i]
+    seq_lens = full_attention_mask.sum(dim=1)
+    reward_tensor = torch.zeros_like(values_full)
+    for b in range(batch_size):
+        last_idx = seq_lens[b].item() - 1
+        reward_tensor[b, last_idx] = reward_list[b]
 
-    # train_mask => newly generated
-    original_lens = enc["attention_mask"].sum(dim=1)
-    train_mask = torch.zeros_like(input_ids, dtype=torch.float, device=device)
-    for i in range(batch_size):
-        start = int(original_lens[i].item())
-        end = int(seq_lens[i].item())
-        train_mask[i, start:end] = 1.0
+    # train_mask => newly generated portion
+    prompt_lens = attention_mask.sum(dim=1)
+    train_mask = torch.zeros_like(full_input_ids, dtype=torch.float)
+    for b in range(batch_size):
+        start = int(prompt_lens[b].item())
+        end = int(seq_lens[b].item())
+        train_mask[b, start:end] = 1.0
 
     return (
-        input_ids,
-        attention_mask,
+        full_input_ids,
+        full_attention_mask,
         old_logprobs,
-        values_final,
+        values_full,
         reward_tensor,
         train_mask,
         reward_list
@@ -300,14 +250,14 @@ def ppo_step(
     mask_sum = valid_mask.sum()
     policy_loss = pg_loss_.sum() / mask_sum.clamp_min(1.0)
 
+    # Value Loss
     v_clipped = old_values + torch.clamp(new_values - old_values, -clip_range, clip_range)
     vf_loss1 = (new_values - returns) ** 2
     vf_loss2 = (v_clipped - returns) ** 2
     vf_loss_ = 0.5 * torch.max(vf_loss1, vf_loss2)
     value_loss = (vf_loss_ * valid_mask).sum() / mask_sum.clamp_min(1.0)
 
-    # KL vs reference
-
+    # KL vs reference model
     with torch.no_grad():
         ref_out = ref_model(
             input_ids=input_ids,
@@ -341,10 +291,11 @@ def ppo_step(
 
 
 ###############################################################################
-# 5) EVAL
+# 5) EVAL  (★) Also call raw_lm.generate instead of DDP, for consistency
 ###############################################################################
 def evaluate_on_test_set(
         policy_value_model,
+        raw_lm,  # unwrapped LM
         tokenizer,
         test_data,
         prompt_manager,
@@ -352,10 +303,11 @@ def evaluate_on_test_set(
         accelerator=None
 ):
     """
-    Single-step generation for each question => parse answer => compute MAE
+    Evaluate by generating from raw_lm, then parse the final text for carbs.
     """
     device = next(policy_value_model.parameters()).device
     policy_value_model.eval()
+    raw_lm.eval()
 
     mae_list = []
     idx = 0
@@ -365,43 +317,36 @@ def evaluate_on_test_set(
         questions = [item["question"] for item in subset]
         true_vals = [float(item["answer_value"]) for item in subset]
 
-        # Use prompt_manager for each question
-        prompts = [prompt_manager.build_prompt(q) for q in questions]
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        # Use inference prompt for consistency
+        inference_prompts = [prompt_manager.build_inference_prompt(q) for q in questions]
+        enc = tokenizer(inference_prompts, return_tensors="pt", padding=True, truncation=True)
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc["attention_mask"].to(device)
 
         with torch.no_grad():
-            logits, vals = policy_value_model(input_ids, attn_mask)
-        seq_lens = attn_mask.sum(dim=1)
+            # multi-token generation using raw_lm
+            outputs = raw_lm.generate(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=50,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=False
+            )
 
-        # single-step argmax generation
-        next_tokens = []
-        for b in range(input_ids.size(0)):
-            pos = seq_lens[b].item() - 1
-            lmb = logits[b, pos, :]
-            nxt = torch.argmax(lmb, dim=-1).unsqueeze(0)
-            next_tokens.append(nxt)
-        next_tokens = torch.cat(next_tokens, dim=0)
-
-        gen_texts = []
-        for i in range(input_ids.size(0)):
-            base_seq = input_ids[i, :seq_lens[i]].cpu().tolist()
-            base_seq.append(next_tokens[i].item())
-            txt = tokenizer.decode(base_seq, skip_special_tokens=True)
-            gen_texts.append(txt)
+        gen_texts = [tokenizer.decode(seq, skip_special_tokens=False) for seq in outputs]
 
         for i, text in enumerate(gen_texts):
             chain_of_thought, final_ans = prompt_manager.parse_cot_and_answer(
-                text, 
-                verbose=accelerator is not None,
-                log_fn=accelerator.print if accelerator else None
+                text,
+                verbose=False
             )
             guess = prompt_manager.extract_carbs_from_answer(final_ans)
             if guess is not None:
                 mae_list.append(abs(guess - true_vals[i]))
 
     policy_value_model.train()
+    raw_lm.train()
     if len(mae_list) == 0:
         return None
     return sum(mae_list) / len(mae_list)
@@ -413,8 +358,8 @@ def evaluate_on_test_set(
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warm_start_model", type=str, default="google/gemma-3-1b-it",
-                        help="Path or HF ID for Gemma3ForCausalLM, e.g. google/gemma-3-1b-it")
+    parser.add_argument("--warm_start_model", type=str, default="fine_tuned_model",
+                        help="Path to your *fine-tuned* model checkpoint.")
     parser.add_argument("--train_file", type=str, required=True)
     parser.add_argument("--test_file", type=str, default=None)
     parser.add_argument("--kl_coef", type=float, default=0.01)
@@ -425,10 +370,9 @@ def main():
     parser.add_argument("--data_fraction", type=float, default=0.1)
     parser.add_argument("--wandb_project", type=str, default="ppo_nutri_g3")
     parser.add_argument("--wandb_entity", type=str, default="nmysore-uc-santa-barbara")
-    parser.add_argument("--max_new_tokens", type=int, default=400,
-                        help="Number of tokens to sample in each rollout.")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Sampling temperature.")
+    parser.add_argument("--max_new_tokens", type=int, default=300)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--do_sample", action="store_true", help="Use sampling instead of greedy.")
     args = parser.parse_args()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
@@ -469,14 +413,14 @@ def main():
 
     accelerator.print(f"Loaded {len(dataset)} training samples from {args.train_file}")
 
-    # 2) Load warm-start model (Gemma3ForCausalLM)
-    accelerator.print(f"Loading policy base from {args.warm_start_model}")
+    # 2) (★) Load your fine-tuned model as raw_lm. Keep it unwrapped for .generate() calls
+    accelerator.print(f"Loading raw_lm from {args.warm_start_model}")
     config = AutoConfig.from_pretrained(args.warm_start_model, trust_remote_code=True)
     if hasattr(config, "vision_config"):
         del config.vision_config
     config.use_cache = False
 
-    base_model = Gemma3ForCausalLM.from_pretrained(
+    raw_lm = Gemma3ForCausalLM.from_pretrained(
         args.warm_start_model,
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,
@@ -496,8 +440,8 @@ def main():
     for p in ref_base.parameters():
         p.requires_grad = False
 
-    # 3) Build policy-value model
-    policy_value_model = PolicyValueModel(base_model)
+    # 3) Build policy-value model from raw_lm, but do not alter raw_lm for .generate
+    policy_value_model = PolicyValueModel(raw_lm)
     policy_value_model.to(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32)
 
     # 4) Load tokenizer
@@ -507,6 +451,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
+    # (★) Wrap policy_value_model + ref_base in DDP, but NOT raw_lm
     policy_value_model, ref_base = accelerator.prepare(policy_value_model, ref_base)
 
     # 5) optimizer
@@ -531,12 +476,7 @@ def main():
             b_q = [x[0] for x in batch_slice]
             b_a = [x[1] for x in batch_slice]
 
-            # -----------
-            # Use PromptManager to build prompts
-            prompts = [prompt_manager.build_prompt(q) for q in b_q]
-            # -----------
-
-            # multi-step rollout
+            # multi-step rollout with raw_lm for generation
             (new_input_ids,
              new_attn_mask,
              old_logprobs,
@@ -545,13 +485,15 @@ def main():
              train_mask,
              reward_list) = rollout_step(
                 policy_value_model,
+                raw_lm,                 # (★) pass the unwrapped model
                 tokenizer,
-                prompts,
+                b_q,
                 b_a,
                 prompt_manager,
                 max_new_tokens=args.max_new_tokens,
                 accelerator=accelerator,
-                temperature=args.temperature
+                temperature=args.temperature,
+                do_sample=args.do_sample
             )
 
             avg_reward = sum(reward_list) / len(reward_list)
@@ -599,6 +541,7 @@ def main():
             if test_data and accelerator.is_main_process and (global_step % 50 == 0):
                 quick_mae = evaluate_on_test_set(
                     policy_value_model,
+                    raw_lm,            # pass raw_lm for generation in eval
                     tokenizer,
                     test_data,
                     prompt_manager,
@@ -620,6 +563,7 @@ def main():
         if test_data and accelerator.is_main_process:
             mae = evaluate_on_test_set(
                 policy_value_model,
+                raw_lm,
                 tokenizer,
                 test_data,
                 prompt_manager,
