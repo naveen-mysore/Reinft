@@ -84,7 +84,13 @@ class PolicyValueModel(nn.Module):
         self.base_model = base_model
         hidden_size = base_model.config.hidden_size
         # minimal value head
-        self.v_head = nn.Linear(hidden_size, 1)
+        self.v_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 1)
+        )
 
     def forward(self, input_ids, attention_mask):
         out = self.base_model(
