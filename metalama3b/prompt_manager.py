@@ -6,341 +6,182 @@ from typing import Optional, Tuple
 class PromptManager:
     """
     Class to manage prompt templates and generation,
-    using a conversation-like format suitable for LLaMA-based models.
+    using a conversation-like format compatible with LLaMA-based models.
+    
+    We adopt a standard Llama 2 style prompt:
+      <s>[INST] ...system instructions... ...user prompt... [/INST]
+      (assistant response) 
+      </s>
+      
+    We still keep <|begin_cot|> / <|end_cot|> around if you want to store
+    chain-of-thought for training. 
     """
 
     def __init__(self):
-        ########################################################################
-        # 1) Store your system instructions in a single string
-        ########################################################################
+        # System instructions: what the model should do globally
         self.system_instructions = (
-            "You are a helpful nutrition assistant that calculates the total carbohydrates in a meal.\n"
-            "For the given query including a meal description, think step by step as follows:\n"
-            "1. Parse the meal description into discrete food or beverage items along with their serving size. "
-            "   If the serving size of any item in the meal is not specified, assume it is a single standard serving "
-            "   based on common nutritional guidelines (e.g., USDA). Ignore additional information that doesn't relate "
-            "   to the item name and serving size.\n"
-            "2. For each food or beverage item in the meal, calculate the amount of carbohydrates in grams for the "
-            "   specific serving size.\n"
-            '3. For the total carbohydrates, respond with just the numeric amount of carbohydrates without extra text. '
-            '   If you don\'t know the answer, set the value of "total_carbohydrates" to -1.\n'
-            "4. Always respond in the user's original natural language of the Query.\n"
-            "5. Respond with a dictionary object containing the total carbohydrates in grams as follows:\n"
-            '{"total_carbohydrates": total grams of carbohydrates for the serving}\n\n'
-
-            # Example 1
-            'Example 1:\n'
-            'Query: "This morning, I had a cup of oatmeal with half a sliced banana and a glass of orange juice."\n'
-            "Answer:<cot>\n"
-            "The meal consists of 1 cup of oatmeal, 1/2 a banana and 1 glass of orange juice.\n"
-            "1 cup of oatmeal has 27g carbs.\n"
-            "1 banana has 27g carbs so half a banana has (27*(1/2)) = 13.5g carbs.\n"
-            "1 glass of orange juice has 26g carbs.\n"
-            "So the total grams of carbs in the meal = (27 + 13.5 + 26) = <66.5>g carbs\n"
-            "</cot>\n"
-            '<answer>Output: {"total_carbohydrates": 66.5}</answer>\n\n'
-
-            # Example 2
-            'Example 2:\n'
-            'Query: "朝食に、卵2個で作ったスクランブルエッグとトーストを食べました。"\n'
-            "Answer:<cot>\n"
-            "その食事は卵2個で作ったスクランブルエッグと1枚のトーストで構成されています。\n"
-            "卵2個で作ったスクランブルエッグには2gの炭水化物があります。\n"
-            "1枚のトーストには13gの炭水化合物があります。\n"
-            "よって、その食事に含まれる炭水化合物の総量は = (2 + 13) = <15>g です\n"
-            "</cot>\n"
-            '<answer>Output: {"total_carbohydrates": 15}</answer>\n\n'
-
-            # Example 3
-            'Example 3:\n'
-            'Query: "半个花生酱和果酱三明治。"\n'
-            "Answer:<cot>\n"
-            "这份餐点由1/2的花生酱和果酱三明治组成。\n"
-            "1个花生酱和果酱三明治含有50.6g碳水化合物，所以半个花生酱和果酱三明治\n"
-            "含有(50.6*(1/2)) = <25.3>g碳水化合物\n"
-            "因此，这份餐所含的碳水化合物总量 = <25.3>g碳水化合物\n"
-            "</cot>\n"
-            '<answer>Output: {"total_carbohydrates": 25.3}</answer>'
+            "You are a nutrition assistant that calculates the total carbohydrates in any given food. When responding, break each item into its components, look up or estimate the carbs per serving for each component, and sum those values to find the total. Clearly explain how you arrived at that total by describing your step-by-step reasoning. Finally, present the total carbohydrate content inside angle brackets (e.g., <10> grams) and respond in the same language as the user's query.\n"
         )
 
-        ########################################################################
-        # 2) Minimal base prompt (training mode) that does NOT include system text
-        ########################################################################
-        self.training_base_prompt = "<start_of_turn>user\n"
-
-    def build_prompt(self, query: str, mode: str = "training") -> str:
+    def build_prompt(self, query, mode="inference"):
         """
-        Build the complete prompt, either for training or inference.
-
+        Backward compatibility method that redirects to the appropriate prompt builder.
+        
         Args:
-            query: The user's meal query text
-            mode: "training" or "inference"
-
+            query: The user query
+            mode: Either "inference" or "training"
+            
         Returns:
-            Full prompt text
+            The formatted prompt in Llama style
         """
         if mode == "inference":
-            # For inference, full system role with instructions + examples
-            # User role contains only the actual query
-            return (
-                "<start_of_turn>system\n"
-                f"{self.system_instructions}\n"
-                "<end_of_turn>\n"
-                "<start_of_turn>user\n"
-                f'Query: "{query}"\n'
-                "<end_of_turn>\n"
-                "<start_of_turn>model\n"
-                "Answer:<cot>\n"
-            )
+            return self.build_inference_prompt(query)
         else:
-            # Training mode: minimal prompt (no system instructions)
-            return (
-                    self.training_base_prompt
-                    + f'Query: "{query}"\n'
-                      "<end_of_turn>\n"
-                      "<start_of_turn>model\n"
-                      "Answer:<cot>\n"
-            )
+            # For training mode, just build the inference prompt (without answer)
+            # The actual training samples are built with build_training_sample
+            return self.build_inference_prompt(query)
 
-    def build_training_sample(
-            self,
-            query: str,
-            cot: str,
-            answer_value: str,
-            eos_token: str
-    ) -> str:
+    def build_inference_prompt(self, user_query: str) -> str:
         """
-        Build a complete training sample with prompt, COT, and final answer.
+        Build the inference-time prompt for Llama style:
 
-        Args:
-            query: The user's meal query text
-            cot: The chain-of-thought reasoning text
-            answer_value: The carbohydrate value to include in the final answer
-            eos_token: The model's end-of-sequence token
-
-        Returns:
-            Complete text for one training example.
+        <s>[INST]
+          (system instructions + examples)
+          User: ...
+        [/INST]
+        Assistant:
+        
+        We do not necessarily need <|begin_cot|> at inference time, 
+        but if you want the chain of thought, you can still add it.
         """
-        prompt = self.build_prompt(query, mode="training")
-        result_json = {"total_carbohydrates": answer_value.strip()}
-
         return (
-                prompt
-                + (cot if cot else "")
-                + "\n</cot>\n"
-                + "<answer>Output: "
-                + json.dumps(result_json)
-                + "</answer><end_of_turn>"
-                + eos_token
+            f"<s>[INST] {self.system_instructions}\n"
+            f"User: {user_query}\n"
+            "[/INST]\n"
+            "Assistant:"
         )
 
-    def build_inference_prompt(self, query: str) -> str:
+    def build_training_sample(
+        self,
+        query: str,
+        cot: str,
+        answer_value: str,
+        eos_token: str
+    ) -> str:
         """
-        Convenience method for building an inference-time prompt
-        with system instructions included.
-
-        Args:
-            query: The user's meal query text
-
-        Returns:
-            The full prompt (including system text) to feed the LLaMA model at inference
+        For supervised fine-tuning, we typically put the system + user
+        instructions in a single [INST] block and then let the 'Assistant:'
+        block hold the chain-of-thought or final answer. 
+        We explicitly add an EOS token at the very end.
         """
-        return self.build_prompt(query, mode="inference")
+        # Llama style system + user block
+        prompt_prefix = (
+            f"<s>[INST] {self.system_instructions}\n"
+            f"User: {query}\n"
+            "[/INST]\n"
+            "Assistant:<|begin_cot|>\n"
+        )
+
+        # If chain-of-thought is empty, we still produce a minimal final answer
+        # Ensure we have at least <answer_value> in brackets somewhere
+        final_cot = cot.strip() if cot else f"<{answer_value.strip()}>"
+        if "<" not in final_cot or ">" not in final_cot:
+            final_cot += f" = <{answer_value.strip()}>"
+
+        # Close chain-of-thought, then close the assistant block with </s> or EOS
+        prompt_suffix = "<|end_cot|>\n</s>"
+
+        return prompt_prefix + final_cot + prompt_suffix + eos_token
 
     def extract_model_block(self, generated_text: str) -> str:
         """
-        Extract the <start_of_turn>model...</end_of_turn> block from the generated text.
-
-        Args:
-            generated_text: The full text generated by the model
-
-        Returns:
-            The extracted model block, or an empty string if not found.
+        Extract the model's portion from a fully generated text that may contain
+        the system + user instructions. Looks for the first 'Assistant:' after the
+        last [INST].
         """
-        start_marker = "<start_of_turn>model"
-        end_marker = "<end_of_turn>"
-
-        start_idx = generated_text.find(start_marker)
-        if start_idx == -1:
-            return ""
-
-        end_idx = generated_text.find(end_marker, start_idx)
-        if end_idx == -1:
-            return generated_text[start_idx:]
-        else:
-            return generated_text[start_idx:end_idx + len(end_marker)]
+        # We can look for the last [INST], then find "Assistant:" 
+        # and return everything from there onward.
+        pattern = r"\[INST\].*?[/INST]\s*Assistant:(.*)"
+        match = re.search(pattern, generated_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return generated_text  # fallback
 
     def parse_cot_and_answer(self, text: str, verbose=False, log_fn=None) -> Tuple[str, str]:
         """
-        Parse a generated response to extract chain-of-thought (CoT) and final answer.
-        Handles multiple formats that might appear in model outputs.
-
-        Args:
-            text: The full text response
-            verbose: Whether to print debug information
-            log_fn: Function to use for logging (e.g., accelerator.print)
-
-        Returns:
-            Tuple of (chain_of_thought, answer)
+        Parse chain-of-thought (CoT) and final <X> answer from the text.
+        1) Extract chain-of-thought from <|begin_cot|> ... <|end_cot|>.
+           If none, fallback to entire assistant block.
+        2) Check the *last two tokens* for a bracketed numeric answer, e.g. <123.45>.
+        3) Return (chain_of_thought, answer_str).
+           If no bracket is found, answer_str is "".
         """
-        # Clean up the text - remove special tokens that might interfere
-        cleaned_text = re.sub(r'<pad>|<bos>|<eos>', '', text).strip()
-
+        # Extract the model's response part first - ensure we're only looking at the assistant's response
+        text_to_parse = self.extract_model_block(text)
+        
+        # Debug logging to see what we're parsing
         if verbose and log_fn:
-            log_fn(f"Parsing text (length: {len(cleaned_text)})")
-            # Show a brief preview if text is long
-            if len(cleaned_text) > 100:
-                log_fn(f"Text preview: {cleaned_text[:50]}...{cleaned_text[-50:]}")
-
-        # Initialize empty results
-        chain_of_thought = ""
-        answer = ""
-
-        # METHOD 1: Extract from XML-style tags
-        cot_match = re.search(r'<cot>(.*?)</cot>', cleaned_text, re.DOTALL)
-        answer_match = re.search(r'<answer>(.*?)</answer>', cleaned_text, re.DOTALL)
-
+            log_fn(f"Parsing text (truncated): {text_to_parse[:100]}...")
+        
+        # Extract CoT content
+        cot_pattern = r"<\|begin_cot\|>(.*?)<\|end_cot\|>"
+        cot_match = re.search(cot_pattern, text_to_parse, re.DOTALL)
         if cot_match:
             chain_of_thought = cot_match.group(1).strip()
             if verbose and log_fn:
-                log_fn("Found CoT using tag pattern")
-
-        if answer_match:
-            answer = answer_match.group(1).strip()
+                log_fn("Found CoT between <|begin_cot|> and <|end_cot|>.")
+        else:
+            chain_of_thought = text_to_parse
             if verbose and log_fn:
-                log_fn("Found answer using tag pattern")
+                log_fn("No <|begin_cot|> found; using entire text as CoT fallback.")
+        
+        # Split the CoT by whitespace and look in the last 1-2 tokens for bracket
+        tokens = chain_of_thought.split()
+        if len(tokens) == 0:
+            # no content => no answer
+            return (chain_of_thought, "")
 
-        # METHOD 2: Look for "final_answer:" sections
-        if not answer:
-            final_ans_pattern = re.search(
-                r'final_answer:\s*(.*?)(?:\n\s*chain_of_thought:|$)',
-                cleaned_text, re.DOTALL | re.IGNORECASE
-            )
-            if final_ans_pattern:
-                answer = final_ans_pattern.group(1).strip()
-                if verbose and log_fn:
-                    log_fn("Found answer using 'final_answer:' pattern")
-
-        # METHOD 3: Look for "Output:" sections with JSON
-        if not answer:
-            output_json_pattern = re.search(
-                r'Output:\s*({.*?"total_carbohydrates".*?})',
-                cleaned_text, re.DOTALL
-            )
-            if output_json_pattern:
-                answer = "Output: " + output_json_pattern.group(1).strip()
-                if verbose and log_fn:
-                    log_fn("Found answer using 'Output:' with JSON pattern")
-
-        # METHOD 4: If still no chain of thought, try to find a "step by step" pattern
-        if not chain_of_thought:
-            step_patterns = [
-                r"Let\'s think step by step\.(.*?)(?:final_answer:|Output:|$)",
-                r"Let\'sthinkstepbystep\.(.*?)(?:final_answer:|Output:|$)",
-                r"Thinking step by step:(.*?)(?:final_answer:|Output:|$)",
-                r"Step by step analysis:(.*?)(?:final_answer:|Output:|$)",
-            ]
-            for pattern in step_patterns:
-                match = re.search(pattern, cleaned_text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    chain_of_thought = match.group(1).strip()
-                    if verbose and log_fn:
-                        log_fn(f"Found CoT using pattern: {pattern[:20]}...")
-                    break
-
-        # METHOD 5: Last resort - look for any carb value patterns in the text
-        if not answer:
-            # Look for total_carbohydrates in various formats
-            carb_patterns = [
-                r'"total_carbohydrates"\s*:\s*"?(\d+\.?\d*)"?',  # JSON format
-                r'total\s+carbs.*?=\s*<?(\d+\.?\d*)>?\s*g',  # equals format with optional brackets
-                r'<(\d+\.?\d*)>\s*grams',  # bracketed value with "grams"
-                r'Output:\s*\(?(\d+\.?\d*)\)?'  # "Output:" with a number
-            ]
-
-            for pattern in carb_patterns:
-                match = re.search(pattern, cleaned_text, re.IGNORECASE | re.DOTALL)
-                if match:
-                    value = match.group(1)
-                    answer = f'Output: {{"total_carbohydrates": "{value}"}}'
-                    if verbose and log_fn:
-                        log_fn(f"Found answer using carb value pattern: {pattern[:20]}...")
-                    break
-
-        if verbose and log_fn:
-            log_fn("Final extracted values:")
-            log_fn(f"CoT length: {len(chain_of_thought)}")
-            log_fn(f"Answer: {answer}")
-
-        return chain_of_thought, answer
+        # gather last 2 tokens (or 1 if there's only 1)
+        last_tokens = tokens[-2:] if len(tokens) >= 2 else tokens[-1:]
+        snippet = " ".join(last_tokens)
+        
+        match = re.search(r"<([\-\d\.]+)>", snippet)
+        if match:
+            answer_str = match.group(1).strip()
+            if verbose and log_fn:
+                log_fn(f"Found bracketed numeric answer in the last tokens: {answer_str}")
+        else:
+            answer_str = ""
+            if verbose and log_fn:
+                log_fn("No bracket found in last tokens => empty answer")
+        
+        return chain_of_thought, answer_str
 
     def extract_carbs_from_answer(self, answer_text: str) -> Optional[float]:
         """
-        Extract the carbohydrate value from the answer text, handling multiple formats.
-
-        Args:
-            answer_text: The text of the answer section
-
-        Returns:
-            The extracted carbohydrate value as a float, or None if not found
+        Attempt to parse the bracketed float, e.g. <123.45>.
+        If not found, fallback to numeric parse from any substring in 'answer_text'.
+        Returns None if no valid parse.
         """
-        if not answer_text or not answer_text.strip():
+        if not answer_text:
             return None
 
-        # Try direct pattern matching first
-        pattern = r'"total_carbohydrates"\s*:\s*"?(-?\d+(?:\.\d+)?)"?'
-        match = re.search(pattern, answer_text)
-        if match:
+        # 1) Direct bracket parse
+        bracket_vals = re.findall(r"<([\-\d\.]+)>", answer_text)
+        if bracket_vals:
+            # take the last bracket
+            val_str = bracket_vals[-1]
             try:
-                return float(match.group(1))
+                return float(val_str)
             except ValueError:
                 pass
 
-        # Look for numbers inside JSON format
-        json_pattern = r'{.*?}'
-        json_match = re.search(json_pattern, answer_text, re.DOTALL)
-        if json_match:
-            try:
-                json_str = json_match.group(0)
-                json_str = re.sub(r'\s+', ' ', json_str)
-                data = json.loads(json_str)
-                if "total_carbohydrates" in data:
-                    carb_value = data["total_carbohydrates"]
-                    if isinstance(carb_value, (int, float)):
-                        return float(carb_value)
-                    elif isinstance(carb_value, str):
-                        return float(carb_value)
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # Look for numbers inside <> brackets
-        angle_pattern = r'<(\d+(?:\.\d+)?)>'
-        angle_match = re.search(angle_pattern, answer_text)
-        if angle_match:
-            try:
-                return float(angle_match.group(1))
-            except ValueError:
-                pass
-
-        # Try "Output:" or "="
-        for marker in ["Output:", "="]:
-            if marker in answer_text:
-                after_marker = answer_text.split(marker)[-1]
-                num_pattern = r'(\d+(?:\.\d+)?)'
-                num_match = re.search(num_pattern, after_marker)
-                if num_match:
-                    try:
-                        return float(num_match.group(1))
-                    except ValueError:
-                        pass
-
-        # Last resort: any number in the text
-        num_pattern = r'(\d+(?:\.\d+)?)'
-        num_match = re.search(num_pattern, answer_text)
-        if num_match:
-            try:
-                return float(num_match.group(1))
-            except ValueError:
-                pass
+        # 2) fallback: parse numeric from entire string
+        try:
+            clean = re.sub(r"[^\d\.]+", "", answer_text)
+            if clean:
+                return float(clean)
+        except ValueError:
+            pass
 
         return None

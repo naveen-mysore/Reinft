@@ -6,14 +6,18 @@ so we can call raw_lm.generate(...) even after DDP wrapping policy_value_model.
 """
 
 import os
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7,8,9"
 import json
 import math
 import random
 import re
+import copy
+
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import shutil
 
 from typing import Optional
 from collections import deque
@@ -29,6 +33,7 @@ from transformers import (
 )
 
 from prompt_manager import PromptManager
+from trl import AutoModelForCausalLMWithValueHead
 
 ###############################################################################
 # 1) PPO REWARD + ADVANTAGE UTILS
@@ -43,9 +48,9 @@ def compute_logprobs_from_logits(logits, labels):
 def gaussian_reward(
         pred_value: float,
         true_value: float,
-        sigma: float = 10.0,
-        near_exact_range: float = 1.0,
-        near_exact_bonus: float = 1.0
+        sigma: float = 5.0,
+        near_exact_range: float = 5.0,
+        near_exact_bonus: float = 3.0
 ):
     """
     Computes a reward in (0, +∞) based on a Gaussian decay from the ground truth.
@@ -74,61 +79,100 @@ def gaussian_reward(
     return base_reward
 
 
-def scaled_reward(pred_value: float, true_value: float, threshold=5.0, accelerator=None):
+def scaled_reward(pred_value: float, true_value: float, threshold=10.0, close_bonus_threshold=4.0, close_bonus=1.0, accelerator=None):
     """
     A simple numeric reward function for how close 'pred_value' is to 'true_value',
-    giving up to 1.0 if within 'threshold' range, else 0.0.
+    giving up to 1.0 if within 'threshold' range, plus an additional bonus if very close.
+    
+    Args:
+        pred_value: The predicted carbohydrate value
+        true_value: The true carbohydrate value
+        threshold: Maximum difference for non-zero reward (linear scaling)
+        close_bonus_threshold: Threshold for additional bonus (e.g., 4 grams)
+        close_bonus: Extra reward for predictions within close_bonus_threshold
+        accelerator: Optional accelerator for distributed logging
+        
+    Returns:
+        Reward value between 0.0 and (1.0 + close_bonus)
     """
     diff = abs(pred_value - true_value)
+    
+    # Start with base reward (linear scaling from threshold to 0)
     if diff >= threshold:
-        return 0.0
+        base_reward = 0.0
     else:
-        # linear scale from 1.0 down to 0.0 as diff goes 0..threshold
-        return 1.0 - (diff / threshold)
+        # Linear scale from 1.0 down to 0.0 as diff goes 0..threshold
+        base_reward = 2.0 - (diff / threshold)
+    
+    # Add bonus for very accurate predictions
+    bonus = close_bonus if diff <= close_bonus_threshold else 0.0
+    
+    return base_reward + bonus
 
 
-def compute_gae_advantages(rewards, old_values, gamma=0.95, lam=0.95):
-    seq_len = old_values.size(1)
+def compute_gae_advantages(rewards, values, gamma=0.99, lam=0.95, mask=None):
+    """
+    Compute Generalized Advantage Estimation across token sequences.
+    
+    Args:
+        rewards: Tensor of shape [batch_size, seq_len] with rewards
+        values: Tensor of shape [batch_size, seq_len] with value predictions
+        gamma: Discount factor
+        lam: GAE lambda parameter
+        mask: Optional attention mask to identify valid tokens
+    
+    Returns:
+        advantages: Tensor of shape [batch_size, seq_len]
+        returns: Tensor of shape [batch_size, seq_len]
+    """
+    batch_size = rewards.size(0)
+    seq_len = rewards.size(1)
+    
+    # Create a proper mask if none is provided
+    if mask is None:
+        mask = torch.ones_like(rewards)
+    else:
+        # Ensure mask has the same shape as rewards and values
+        if mask.size(1) != seq_len:
+            # Create a new mask with the same shape as rewards
+            new_mask = torch.zeros_like(rewards)
+            # Copy over the values from the original mask, up to its length
+            for b in range(batch_size):
+                mask_len = min(mask.size(1), seq_len)
+                new_mask[b, :mask_len] = mask[b, :mask_len]
+            mask = new_mask
+    
     advantages = torch.zeros_like(rewards)
-    last_gae = 0.0
-    for t in reversed(range(seq_len)):
-        if t == seq_len - 1:
-            next_val = 0.0
-        else:
-            next_val = old_values[:, t + 1]
-        delta = rewards[:, t] + gamma * next_val - old_values[:, t]
-        advantages[:, t] = last_gae = delta + gamma * lam * last_gae
-    returns_ = advantages + old_values
-    return advantages, returns_
+    returns = torch.zeros_like(rewards)
+    
+    # Process each batch item separately
+    for b in range(batch_size):
+        # Process tokens in reverse order for GAE calculation
+        gae = 0
+        for t in reversed(range(seq_len)):
+            # Skip if this token is masked out
+            if mask[b, t] == 0:
+                continue
+                
+            # For last token or if next token is masked, bootstrap is 0
+            if t == seq_len - 1 or mask[b, t+1] == 0:
+                next_value = 0
+            else:
+                next_value = values[b, t+1]
+            
+            # GAE calculation formula
+            delta = rewards[b, t] + gamma * next_value - values[b, t]
+            gae = delta + gamma * lam * gae
+            
+            # Store results
+            advantages[b, t] = gae
+            returns[b, t] = gae + values[b, t]
+    
+    return advantages, returns
 
 ###############################################################################
 # 2) POLICY-VALUE MODEL WRAPPER
 ###############################################################################
-class PolicyValueModel(nn.Module):
-    """
-    Wraps a LlamaForCausalLM + an extra value head in text-only mode.
-    """
-    def __init__(self, base_model: nn.Module):
-        super().__init__()
-        self.base_model = base_model
-        hidden_size = base_model.config.hidden_size  # LLaMA uses `hidden_size`
-        # Minimal value head
-        self.v_head = nn.Sequential(
-            nn.Linear(hidden_size, 1)
-        )
-
-    def forward(self, input_ids, attention_mask):
-        out = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False
-        )
-        lm_logits = out.logits  # [B, seq_len, vocab]
-        last_hidden = out.hidden_states[-1]  # [B, seq_len, hidden_size]
-        values = self.v_head(last_hidden).squeeze(-1)  # [B, seq_len]
-        return lm_logits, values
 
 
 ###############################################################################
@@ -145,7 +189,7 @@ def find_sublist(sub, main):
 
 
 def rollout_step(
-    policy_value_model: PolicyValueModel,
+    policy_value_model,
     raw_lm,
     tokenizer,
     prompts,
@@ -154,185 +198,201 @@ def rollout_step(
     max_new_tokens=200,
     accelerator=None,
     temperature=1.0,
-    do_sample=False
+    do_sample=False,
+    kl_coef=0.02,
+    cot_kl_discount=0.5,
+    step_reward=0.001,
+    ref_base=None
 ):
     """
-    Generate text with the same prompt style as inference (so <cot> and <answer> appear),
-    then parse and compute rewards. Use raw_lm for .generate() to avoid DDP issues.
+    Generate text and create properly padded tensors with consistent dimensions.
+    Includes KL penalty calculation and properly handles batch dimensions.
     """
     device = next(policy_value_model.parameters()).device
     batch_size = len(prompts)
 
-    # Build training prompts
-    training_prompts = [prompt_manager.build_prompt(p, mode="training") for p in prompts]
+    # 1) Build prompts
+    training_prompts = [prompt_manager.build_prompt(p, mode="inference") for p in prompts]
     enc = tokenizer(training_prompts, return_tensors="pt", padding=True, truncation=True)
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
+    base_input_ids = enc["input_ids"].to(device)
+    base_attention_mask = enc["attention_mask"].to(device)
 
-    # 1) Generate final sequences with raw_lm
-    raw_lm.eval()
+    # 2) Generate text with unwrapped policy_value_model
     with torch.no_grad():
-        outputs = raw_lm.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=False
-        )
-    raw_lm.train()
+        # Unwrap the model before calling generate
+        unwrapped_policy = accelerator.unwrap_model(policy_value_model)
+        
+        if do_sample:
+            new_ids = unwrapped_policy.generate(
+                input_ids=base_input_ids,
+                attention_mask=base_attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        else:
+            new_ids = unwrapped_policy.generate(
+                input_ids=base_input_ids,
+                attention_mask=base_attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
 
+    # 3) Convert to text
     final_texts = [
-        tokenizer.decode(seq, skip_special_tokens=False)
-        for seq in outputs
+        tokenizer.decode(seq, skip_special_tokens=False) for seq in new_ids
     ]
 
-    # 2) Parse <cot> and <answer>, compute reward VALUES (without assigning yet)
-    reward_list = []
-    pred_values = []
+    # After generating and getting final_texts, add logging
+    # Log a sample of generations (limit to 2 examples to avoid flooding logs)
+    if accelerator and accelerator.is_main_process:
+        num_examples = min(2, len(final_texts))
+        accelerator.print("\n" + "="*80)
+        accelerator.print(f"SAMPLE GENERATIONS (temp={temperature}, do_sample={do_sample}):")
+        for i in range(num_examples):
+            accelerator.print(f"\nEXAMPLE {i+1}:")
+            accelerator.print(f"PROMPT: {prompts[i][:100]}...")
+            accelerator.print(f"RESPONSE:\n{final_texts[i]}")
+        accelerator.print("="*80 + "\n")
 
-    for i, text in enumerate(final_texts):
-        has_cot = ("<cot>" in text) and ("</cot>" in text)
-        has_answer = ("<answer>" in text) and ("</answer>" in text)
-        has_output_dict = False
-        if has_answer and "Output: {\"total_carbohydrates\":" in text:
-            has_output_dict = True
-        correct_structure = has_cot and has_answer and has_output_dict
-        structure_reward = 0.02 if correct_structure else 0.0
-
-        chain_of_thought, final_ans = prompt_manager.parse_cot_and_answer(
-            text,
-            verbose=accelerator is not None,
-            log_fn=accelerator.print if accelerator else None
-        )
-        guess = prompt_manager.extract_carbs_from_answer(final_ans)
-        pred_values.append(guess)
-
-        # Check if the answer is malformed
+    # 4) Parse each response, compute numeric reward
+    # Initialize lists with proper batch size
+    parsing_success = [False] * batch_size  # Pre-allocate with correct size
+    cots = [None] * batch_size              # Pre-allocate with correct size
+    pred_values = [None] * batch_size       # Pre-allocate with correct size
+    reward_list = [0.0] * batch_size        # Pre-allocate with correct size
+    
+    # Process each item in the batch
+    for i in range(batch_size):
+        text = final_texts[i]
+        # Parse chain-of-thought from the text
+        cot, ans_val = prompt_manager.parse_cot_and_answer(text)
+        cots[i] = cot  # Use index assignment instead of append
+        
+        # Convert numeric value to float and calculate reward
         is_malformed = False
-        if final_ans:
-            # We can try a quick format check:
-            clean_json = re.match(r'.*?"total_carbohydrates":\s*"?(\d+\.?\d*)"?\s*}.*?', final_ans)
-            clean_output = re.match(r'Output:\s*(\d+\.?\d*)\s*$', final_ans)
-            json_with_garbage = re.search(r'"total_carbohydrates":\s*"?(\d+\.?\d*)[^"}]*[^0-9\.\s"}]', final_ans)
-            if (not (clean_json or clean_output)) or json_with_garbage:
-                is_malformed = True
-
+        try:
+            guess = float(ans_val)
+            parsing_success[i] = True  # Already using index assignment
+        except ValueError:
+            guess = None
+            parsing_success[i] = False  # Already using index assignment
+            is_malformed = True
+            
+        pred_values[i] = guess  # Use index assignment instead of append
+        
         if guess is None or is_malformed:
-            numeric_reward = 0.0
+            numeric_reward = -0.1
         else:
-            numeric_reward = scaled_reward(guess, true_values[i], threshold=20.0, accelerator=accelerator)
-            # or: numeric_reward = gaussian_reward(guess, true_values[i], sigma=5.0)
+            true_val = float(true_values[i])
+            numeric_reward = gaussian_reward(guess, true_val, sigma=5.0, near_exact_range=5.0, near_exact_bonus=3.0)
+            
+        reward_list[i] = numeric_reward  # Use index assignment instead of append
+        
+        # Add detailed logging for comparison
+        if accelerator and accelerator.is_main_process and i < 3:  # Log first few examples
+            accelerator.print(f"  Final prediction: {guess}")
+            accelerator.print(f"  True value: {true_values[i]}")
+            accelerator.print(f"  Reward: {numeric_reward}")
+            accelerator.print(f"  Is malformed: {is_malformed}")
 
-        reward_val = numeric_reward + structure_reward
-        reward_list.append(reward_val)
+    # 5) Build padded tensors with consistent dimensions
+    batch_lens = [seq.shape[0] for seq in new_ids]
+    max_seq_len = max(batch_lens)
 
-    # 3) Re-encode the full texts to get the full token sequences
-    enc_full = tokenizer(final_texts, return_tensors="pt", padding=True, truncation=True)
-    full_input_ids = enc_full["input_ids"].to(device)
-    full_attention_mask = enc_full["attention_mask"].to(device)
+    input_ids_padded = torch.zeros((batch_size, max_seq_len), dtype=torch.long, device=device)
+    attn_mask_padded = torch.zeros((batch_size, max_seq_len), dtype=torch.float, device=device)
+    train_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.float, device=device)
+    reward_tensor = torch.zeros((batch_size, max_seq_len), dtype=torch.float, device=device)
 
-    with torch.no_grad():
-        lm_logits_full, values_full = policy_value_model(full_input_ids, full_attention_mask)
-
-    old_logprobs = compute_logprobs_from_logits(lm_logits_full[:, :-1, :], full_input_ids[:, 1:])
-    padcol = torch.zeros((old_logprobs.size(0), 1), device=device)
-    old_logprobs = torch.cat([old_logprobs, padcol], dim=1)
-
-    seq_lens = full_attention_mask.sum(dim=1)
-    reward_tensor = torch.zeros_like(values_full)
-
-    # 4) Assign rewards to the tokens containing the numeric guess
-    reward_token_info = []
+    # Fill padded tensors
     for b in range(batch_size):
-        last_idx = seq_lens[b].item() - 1
-        final_reward = reward_list[b]
-        guess = pred_values[b]
+        seq_len_b = batch_lens[b]
+        if seq_len_b > 0:  # Guard against zero-length sequences
+            input_ids_padded[b, :seq_len_b] = new_ids[b]
+            attn_mask_padded[b, :seq_len_b] = 1.0
 
-        reward_assignment = {"token_indices": [], "token_text": ""}
+            # Mark tokens for training (not including the prompt)
+            prompt_tokens = tokenizer(training_prompts[b], return_tensors="pt").input_ids[0]
+            prompt_len = min(len(prompt_tokens), seq_len_b)
+            if prompt_len < seq_len_b:
+                train_mask[b, prompt_len:seq_len_b] = 1.0
+                
+            # Apply step reward to all generated tokens
+            reward_tensor[b, :seq_len_b] = step_reward
+            
+            # Apply the main reward to the last token ONLY if sequence has length > 0
+            reward_tensor[b, seq_len_b-1] += reward_list[b]
 
-        if guess is not None:
-            guess_str = str(guess)
-            candidates = [guess_str]
-            if '.' in guess_str:
-                if guess_str.endswith('.0'):
-                    candidates.append(guess_str[:-2])
-                base, decimal = guess_str.split('.', 1)
-                if len(decimal) > 1:
-                    candidates.append(f"{base}.{decimal[:-1]}")
-
-            found = False
-            for candidate in candidates:
-                guess_tokens = tokenizer(candidate, add_special_tokens=False)["input_ids"]
-                if not guess_tokens:
+    # 6) Calculate KL penalty if reference model is provided
+    kl_penalty = torch.zeros_like(reward_tensor)
+    if ref_base is not None and kl_coef > 0:
+        with torch.no_grad():
+            # Get policy logits
+            policy_out = policy_value_model(
+                input_ids=input_ids_padded,
+                attention_mask=attn_mask_padded,
+                use_cache=False
+            )
+            policy_logits = policy_out.logits if hasattr(policy_out, 'logits') else policy_out[0]
+            
+            # Get reference logits
+            ref_out = ref_base(
+                input_ids=input_ids_padded,
+                attention_mask=attn_mask_padded,
+                use_cache=False
+            )
+            ref_logits = ref_out.logits if hasattr(ref_out, 'logits') else ref_out[0]
+            
+            # Calculate log probabilities
+            policy_log_probs = F.log_softmax(policy_logits, dim=-1)
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+            
+            # Calculate KL for each token
+            for b in range(batch_size):
+                seq_len_b = batch_lens[b]
+                if seq_len_b <= 1:  # Skip if sequence is too short
                     continue
+                
+                for t in range(seq_len_b - 1):
+                    token_next = input_ids_padded[b, t+1]
+                    policy_lp = policy_log_probs[b, t, token_next]
+                    ref_lp = ref_log_probs[b, t, token_next]
+                    token_kl = policy_lp.exp() * (policy_lp - ref_lp)
+                    
+                    # Apply KL coefficient, possibly discounted for CoT tokens
+                    kl_multiplier = kl_coef
+                    if train_mask[b, t] > 0 and t < seq_len_b - 2:
+                        kl_multiplier = kl_coef * cot_kl_discount
+                    
+                    kl_penalty[b, t] = token_kl * kl_multiplier
+            
+            # Apply KL penalty to reward
+            reward_tensor = reward_tensor - kl_penalty
 
-                full_ids_list = full_input_ids[b].tolist()
-                found_idx = find_sublist(guess_tokens, full_ids_list)
-                if found_idx != -1:
-                    assigned_indices = []
-                    for j in range(len(guess_tokens)):
-                        reward_tensor[b, found_idx + j] = final_reward
-                        assigned_indices.append(found_idx + j)
-                    reward_assignment["token_indices"] = assigned_indices
-                    reward_assignment["token_text"] = candidate
-                    found = True
-                    break
-
-            if not found:
-                reward_tensor[b, last_idx] = final_reward
-                reward_assignment["token_indices"] = [last_idx]
-                reward_assignment["token_text"] = "last token (fallback)"
-        else:
-            reward_tensor[b, last_idx] = final_reward
-            reward_assignment["token_indices"] = [last_idx]
-            reward_assignment["token_text"] = "last token (no prediction)"
-
-        reward_token_info.append(reward_assignment)
-
-    # 5) Build train_mask to only include newly generated tokens
-    train_mask = torch.zeros_like(values_full)
-    for b in range(batch_size):
-        original_prompt_len = input_ids[b].shape[0]
-        if original_prompt_len < seq_lens[b]:
-            train_mask[b, original_prompt_len:seq_lens[b]] = 1.0
-
-    # 6) Create CoT mask to up-weight CoT tokens in KL calculation
-    cot_mask = torch.zeros_like(values_full)
-    for b in range(batch_size):
-        text = final_texts[b]
-        if "<cot>" in text and "</cot>" in text:
-            cot_start = text.find("<cot>") + len("<cot>")
-            cot_end = text.find("</cot>")
-            if cot_start < cot_end:
-                cot_text = text[cot_start:cot_end]
-                cot_tokens = tokenizer(cot_text, add_special_tokens=False)["input_ids"]
-                full_ids = full_input_ids[b].tolist()
-                cot_start_idx = find_sublist(cot_tokens, full_ids)
-                if cot_start_idx != -1:
-                    for j in range(len(cot_tokens)):
-                        cot_mask[b, cot_start_idx + j] = 1.0
-
+    # Return all required tensors and metadata
     return (
-        full_input_ids,
-        full_attention_mask,
-        old_logprobs,
-        values_full,
-        reward_tensor,
-        train_mask,
-        reward_list,
-        cot_mask,
+        input_ids_padded,    # [B, max_seq_len]
+        attn_mask_padded,    # [B, max_seq_len]
+        train_mask,          # [B, max_seq_len]
+        reward_tensor,       # [B, max_seq_len]
         final_texts,
-        reward_token_info
+        cots,
+        pred_values,
+        training_prompts,
+        parsing_success,
+        kl_penalty
     )
 
 ###############################################################################
 # 4) PPO STEP
 ###############################################################################
 def ppo_step(
-    model: PolicyValueModel,
+    model,
     optimizer,
     old_logprobs,
     old_values,
@@ -340,95 +400,108 @@ def ppo_step(
     attn_mask,
     reward_tensor,
     train_mask,
-    ref_model,
     advantages,
     returns,
-    cot_mask,
-    kl_coef=0.02,
     clip_range=0.2,
-    vf_coef=1.0,
-    cot_kl_discount=0.5,
-    entropy_coef=0.0
+    vf_coef=0.6
 ):
     """
-    Run a PPO update on a batch of trajectories, with optional entropy bonus.
+    Run a PPO update with proper policy ratio handling.
     """
-    lm_logits, new_values = model(input_ids, attn_mask)
+    # Forward pass
+    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+    
+    # Handle different output formats
+    if isinstance(out, tuple) and len(out) >= 3:
+        lm_logits, _, new_values = out
+    elif hasattr(out, 'logits') and hasattr(out, 'hidden_states'):
+        lm_logits, new_values = out.logits, out.hidden_states
+    else:
+        raise ValueError(f"Unexpected output format from model: {type(out)}")
+    
+    # Make sure new_values has correct shape
+    if new_values.dim() == 3 and new_values.size(2) == 1:
+        new_values = new_values.squeeze(-1)
+
+    # Compute log probs for current policy
     logprobs = compute_logprobs_from_logits(lm_logits[:, :-1, :], input_ids[:, 1:])
     batch_sz = logprobs.size(0)
     padcol = torch.zeros((batch_sz, 1), device=logprobs.device, dtype=logprobs.dtype)
     new_logprobs = torch.cat([logprobs, padcol], dim=1)
 
+    # Combine attention mask with train mask
     valid_mask = attn_mask.float() * train_mask
-    ratio = (new_logprobs - old_logprobs).exp()
-    ratio_masked = ratio * valid_mask
-    adv_masked = advantages * valid_mask
 
+    # Check for empty mask
+    if valid_mask.sum() < 1.0:
+        # No tokens to train on in this batch
+        return {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "total_loss": 0.0,
+            "mean_ratio": 1.0,
+            "std_ratio": 0.0,
+            "mean_advantage": 0.0,
+            "std_advantage": 0.0
+        }
+    
+    # IMPORTANT FIX: Allow ratio to exceed 1.0 by using a more appropriate clamp range
+    delta_logprobs = new_logprobs - old_logprobs
+    # Clamp for numerical stability but allow positive values
+    delta_logprobs = torch.clamp(delta_logprobs, min=-5.0, max=5.0)  # Changed max from 0.0 to 20.0
+    ratio = delta_logprobs.exp()
+    
+    # Compute policy loss using clipped objective
+    adv_masked = advantages * valid_mask
+    ratio_masked = ratio * valid_mask
+
+    # Compute policy loss
     pg_loss1 = -adv_masked * ratio_masked
     pg_loss2 = -adv_masked * torch.clamp(ratio_masked, 1.0 - clip_range, 1.0 + clip_range)
     pg_loss_ = torch.max(pg_loss1, pg_loss2)
+    
     mask_sum = valid_mask.sum().clamp_min(1.0)
     policy_loss = pg_loss_.sum() / mask_sum
 
-    # Value Loss
+    # Value loss with clipping
     v_clipped = old_values + torch.clamp(new_values - old_values, -clip_range, clip_range)
     vf_loss1 = (new_values - returns) ** 2
     vf_loss2 = (v_clipped - returns) ** 2
     vf_loss_ = 0.5 * torch.max(vf_loss1, vf_loss2)
     value_loss = (vf_loss_ * valid_mask).sum() / mask_sum
 
-    # KL vs reference model with CoT discount
-    with torch.no_grad():
-        ref_out = ref_model(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            return_dict=True,
-            use_cache=False
-        )
-        ref_logits = ref_out.logits
-        rlogprobs = compute_logprobs_from_logits(ref_logits[:, :-1, :], input_ids[:, 1:])
-        rlogprobs = torch.cat([rlogprobs, padcol], dim=1)
-
-    log_ratio = new_logprobs - rlogprobs
-    ratio_ref = log_ratio.exp()
-    kl_per_token = ratio_ref * log_ratio
-
-    # Apply KL discount to CoT tokens
-    kl_scaling = (1.0 - cot_mask) + (cot_kl_discount * cot_mask)
-    kl_per_token = kl_per_token * valid_mask * kl_scaling
-    scaled_mask_sum = (valid_mask * kl_scaling).sum().clamp_min(1.0)
-    kl_mean = kl_per_token.sum() / scaled_mask_sum
-    kl_loss = kl_coef * kl_mean
-
-    # Entropy bonus
-    entropy_loss = 0.0
-    mean_entropy = 0.0
-    if entropy_coef > 0:
-        with torch.no_grad():
-            dist = F.softmax(lm_logits[:, :-1, :], dim=-1)
-            log_dist = F.log_softmax(lm_logits[:, :-1, :], dim=-1)
-            entropy_per_token = -(dist * log_dist).sum(dim=-1)
-            entropy_pad = torch.zeros((batch_sz, 1), device=entropy_per_token.device,
-                                      dtype=entropy_per_token.dtype)
-            entropy_per_token_full = torch.cat([entropy_per_token, entropy_pad], dim=1)
-            masked_entropy = entropy_per_token_full * valid_mask
-            mean_entropy = masked_entropy.sum() / mask_sum
-        entropy_loss = -entropy_coef * mean_entropy
-
-    # Total loss
-    total_loss = policy_loss + vf_coef * value_loss + kl_loss + entropy_loss
+    # Total loss and backward
+    total_loss = policy_loss + vf_coef * value_loss
     optimizer.zero_grad()
     total_loss.backward()
+    # Gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
+
+    # Compute stats for logging
+    with torch.no_grad():
+        valid_mask_bool = (valid_mask > 0).bool()
+        if valid_mask_bool.any():
+            ratio_vals = ratio_masked[valid_mask_bool]
+            adv_vals = adv_masked[valid_mask_bool]
+            mean_ratio = ratio_vals.mean()
+            std_ratio = ratio_vals.std().clamp_min(1e-8)
+            mean_adv = adv_vals.mean()
+            std_adv = adv_vals.std().clamp_min(1e-8)
+        else:
+            mean_ratio = torch.tensor(1.0, device=input_ids.device)
+            std_ratio = torch.tensor(0.0, device=input_ids.device)
+            mean_adv = torch.tensor(0.0, device=input_ids.device)
+            std_adv = torch.tensor(0.0, device=input_ids.device)
 
     return {
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
-        "kl_value": kl_mean.item(),
-        "kl_loss": kl_loss.item(),
-        "entropy": mean_entropy.item(),
-        "entropy_loss": entropy_loss if isinstance(entropy_loss, float) else entropy_loss.item(),
-        "total_loss": total_loss.item()
+        "total_loss": total_loss.item(),
+        "mean_ratio": mean_ratio.item(),
+        "std_ratio": std_ratio.item(),
+        "mean_advantage": mean_adv.item(),
+        "std_advantage": std_adv.item()
     }
 
 
@@ -438,30 +511,32 @@ def ppo_step(
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warm_start_model", type=str, default="fine_tuned_model",
+    parser.add_argument("--warm_start_model", type=str, default="/data/nmysore/models/fine_tuned_model",
                         help="Path to your *fine-tuned* model checkpoint.")
     parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--kl_coef", type=float, default=0.0001)
-    parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--n_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=92)
-    parser.add_argument("--data_fraction", type=float, default=0.6)
+    parser.add_argument("--kl_coef", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-6, 
+                        help="Learning rate (default: 5e-6, recommended range: 1e-6 to 1e-5)")
+    parser.add_argument("--n_epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=random.randint(1, 10000),
+                        help="Random seed for reproducibility (default: random)")
+    parser.add_argument("--data_fraction", type=float, default=1.0)
     parser.add_argument("--wandb_project", type=str, default="ppo_nutri_g3")
     parser.add_argument("--wandb_entity", type=str, default="nmysore-uc-santa-barbara")
-    parser.add_argument("--max_new_tokens", type=int, default=300)
-    parser.add_argument("--temperature", type=float, default=3.0)
+    parser.add_argument("--max_new_tokens", type=int, default=400)
+    parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--do_sample", action="store_true", default="True", help="Use sampling instead of greedy.")
-    parser.add_argument("--ppo_epochs", type=int, default=2,
+    parser.add_argument("--ppo_epochs", type=int, default=3,
                         help="Number of PPO update epochs per batch")
     parser.add_argument("--clip_range", type=float, default=0.2,
                         help="PPO clip range parameter")
     parser.add_argument("--cot_kl_discount", type=float, default=0.5,
                         help="Discount factor for KL penalty on CoT tokens (0.0-1.0)")
-    parser.add_argument("--output_dir", type=str, default="ppo_trained_model",
+    parser.add_argument("--output_dir", type=str, default="/data/nmysore/checkpoints/ppo_trained_model",
                         help="Where to store the final PPO model (so inference can load it).")
-    parser.add_argument("--entropy_coef", type=float, default=0.1,
-                        help="Coefficient for entropy bonus in PPO (0.0 to disable)")
+    parser.add_argument("--vf_coef", type=float, default=0.5,
+                        help="Value function coefficient for PPO")
     args = parser.parse_args()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
@@ -481,6 +556,20 @@ def main():
             config=vars(args)
         )
 
+    # Create output directory if it doesn't exist
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        # Save a copy of the args for future reference
+        with open(os.path.join(args.output_dir, "training_args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
+
+    # After wandb.init add checkpoint tracking variables
+    best_reward = -float('inf')
+    last_save_step = 0
+    save_interval = 100  # Save every 100 steps
+    saved_checkpoints = []  # List to track saved checkpoints
+    max_checkpoints_to_keep = 2  # Keep only 2 latest checkpoints
+
     # 1) Load data
     with open(args.train_file, "r") as f:
         data = json.load(f)
@@ -496,7 +585,7 @@ def main():
 
     accelerator.print(f"Loaded {len(dataset)} training samples from {args.train_file}")
 
-    # 2) Load raw model for generation
+    # 2) Load raw LLaMA model for generation
     accelerator.print(f"Loading raw_lm from {args.warm_start_model}")
     config = AutoConfig.from_pretrained(args.warm_start_model)
     config.use_cache = False
@@ -506,6 +595,7 @@ def main():
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,
     )
+    raw_lm = raw_lm.to(accelerator.device)  # Move raw_lm to the same device
 
     # reference model
     accelerator.print("Loading reference model from the same checkpoint")
@@ -514,20 +604,54 @@ def main():
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,
     )
+    ref_base = ref_base.to(accelerator.device)  # Move ref_base to the same device
     for p in ref_base.parameters():
         p.requires_grad = False
 
-    # 3) Build policy-value model
-    policy_value_model = PolicyValueModel(raw_lm)
-    policy_value_model.to(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32)
+    # 3) Build policy-value model using TRL
+    accelerator.print("Loading policy_value_model as TRL AutoModelForCausalLMWithValueHead")
+    policy_value_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        args.warm_start_model,
+        config=config,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,
+    )
 
     # 4) Load tokenizer
     accelerator.print("Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(args.warm_start_model)
-    # For LLaMA-based tokenizers, you may need: use_fast=False
+    
+    # Always set padding_side to 'left' for decoder-only models
+    tokenizer.padding_side = "left"
+    
+    # Set pad token if needed (but always ensure left padding)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "left"
+    
+    # Verify the special tokens exist (for debugging)
+    accelerator.print("Verifying special tokens in tokenizer vocabulary:")
+    expected_tokens = [
+        "<|begin_cot|>", "<|end_cot|>"
+    ]
+    
+    for token in expected_tokens:
+        if token not in tokenizer.get_vocab():
+            print(f"WARNING: Token '{token}' not found in vocabulary! Chain-of-thought parsing may fail.")
+        else:
+            accelerator.print(f"Token {token} found with ID: {tokenizer.convert_tokens_to_ids(token)}")
+            
+    # If tokens are missing, add them now (not ideal but prevents errors)
+    missing_tokens = [t for t in expected_tokens if tokenizer.convert_tokens_to_ids(t) == tokenizer.unk_token_id]
+    if missing_tokens:
+        accelerator.print(f"Adding {len(missing_tokens)} missing special tokens to the tokenizer")
+        special_tokens = {"additional_special_tokens": missing_tokens}
+        num_added = tokenizer.add_special_tokens(special_tokens)
+        
+        # Resize all models' embeddings
+        policy_value_model.pretrained_model.resize_token_embeddings(len(tokenizer))
+        raw_lm.resize_token_embeddings(len(tokenizer))
+        ref_base.resize_token_embeddings(len(tokenizer))
+        
+        accelerator.print("Token embeddings have been resized. Note: newly added token embeddings are random!")
 
     # Wrap for DDP
     policy_value_model, ref_base = accelerator.prepare(policy_value_model, ref_base)
@@ -537,7 +661,7 @@ def main():
     sched = get_constant_schedule_with_warmup(optimizer, 0)
 
     global_step = 0
-    reward_deque = deque(maxlen=100)
+    reward_deque = deque(maxlen=50)
 
     # Initialize PromptManager
     prompt_manager = PromptManager()
@@ -553,145 +677,274 @@ def main():
             b_q = [x[0] for x in batch_slice]
             b_a = [x[1] for x in batch_slice]
 
-            # Rollout
+            # Create a frozen copy of the current policy to serve as old policy
+            old_policy = copy.deepcopy(policy_value_model).eval()
+
+            # Rollout with OLD policy
             (
-                new_input_ids,
-                new_attn_mask,
-                old_logprobs,
-                old_values,
-                reward_tensor,
-                train_mask,
-                reward_list,
-                cot_mask,
+                input_ids_padded,    # [B, max_seq_len]
+                attn_mask_padded,    # [B, max_seq_len] 
+                train_mask,          # [B, max_seq_len]
+                reward_tensor,       # [B, max_seq_len]
                 final_texts,
-                reward_token_info
+                cots,
+                pred_values,
+                training_prompts,    # We need this to re-tokenize if necessary
+                parsing_success,
+                kl_penalty
             ) = rollout_step(
-                policy_value_model,
-                raw_lm,
+                old_policy,          # Use OLD policy for generation
+                raw_lm,              # Keep this parameter for backward compatibility
                 tokenizer,
                 b_q,
                 b_a,
                 prompt_manager,
                 max_new_tokens=args.max_new_tokens,
-                accelerator=accelerator,
+                accelerator=accelerator,  # Make sure to pass accelerator
                 temperature=args.temperature,
-                do_sample=args.do_sample
+                do_sample=args.do_sample,
+                kl_coef=args.kl_coef,
+                cot_kl_discount=args.cot_kl_discount,
+                step_reward=0.0001,
+                ref_base=ref_base
             )
 
-            avg_reward = sum(reward_list) / len(reward_list)
+            # Get average reward from last tokens for monitoring
+            batch_sz = len(b_q)
+            last_rewards = []
+            avg_kl = 0.0
+            kl_count = 0
+            for b in range(batch_sz):
+                seq_len = int(attn_mask_padded[b].sum().item())
+                if seq_len > 0:
+                    last_rewards.append(reward_tensor[b, seq_len-1].item())
+                    
+                    # KL penalty tracking if available
+                    if kl_penalty is not None and kl_penalty.shape[0] > b:
+                        kl_sum = kl_penalty[b].sum().item()
+                        if kl_sum > 0:
+                            avg_kl += kl_sum
+                            kl_count += 1
+            
+            # Calculate statistics
+            avg_reward = np.mean(last_rewards) if last_rewards else 0.0
             reward_deque.append(avg_reward)
-            rolling_avg = sum(reward_deque) / len(reward_deque)
+            avg_kl = avg_kl / max(1, kl_count)
+            avg_pool_reward = np.mean(reward_deque)
+            
+            # Log detailed stats of generation results
+            if accelerator.is_main_process:
+                # Print summary of batch results
+                success_rate = sum(parsing_success) / len(parsing_success) * 100
+                accelerator.print(f"\nBatch Summary - Step {global_step}:")
+                accelerator.print(f"  Parsing success rate: {success_rate:.1f}%")
+                accelerator.print(f"  Avg reward: {avg_reward:.4f} (rolling avg: {avg_pool_reward:.4f})")
+                
+                # Log some examples to wandb if enabled
+                if wandb.run:
+                    # Log a few examples with their parsed values
+                    log_samples = min(3, len(final_texts))
+                    for i in range(log_samples):
+                        # Get reward from the last token of reward_tensor for this example
+                        seq_len = int(attn_mask_padded[i].sum().item())
+                        last_token_reward = reward_tensor[i, seq_len-1].item() if seq_len > 0 else 0.0
+                        
+                        example = {
+                            "prompt": b_q[i],
+                            "response": final_texts[i],
+                            "parsed_value": pred_values[i],
+                            "true_value": b_a[i],
+                            "reward": last_token_reward,  # Use the reward from reward_tensor
+                            "parsing_success": parsing_success[i]
+                        }
+                        wandb.log({f"examples/example_{i}": example}, step=global_step)
 
-            advantages, returns_ = compute_gae_advantages(reward_tensor, old_values)
-
-            # Add advantage whitening
+            # [A] We must compute old_values and old_logprobs from old_policy on the *exact* generated tokens
             with torch.no_grad():
-                advantages = advantages * train_mask
-                valid_mask_bool = (train_mask > 0).bool()
-                valid_adv = advantages[valid_mask_bool]
-                mean_adv = valid_adv.mean()
-                std_adv = valid_adv.std() + 1e-8
-                advantages = (advantages - mean_adv) / std_adv
+                # 1) Forward pass old_policy on the generated tokens:
+                old_out = old_policy(
+                    input_ids=input_ids_padded,
+                    attention_mask=attn_mask_padded,
+                    use_cache=False
+                )
+                # 2) Extract logits + values
+                if isinstance(old_out, tuple) and len(old_out) >= 3:
+                    old_lm_logits, _, old_values = old_out
+                elif hasattr(old_out, 'logits') and hasattr(old_out, 'hidden_states'):
+                    old_lm_logits, old_values = old_out.logits, old_out.hidden_states
+                else:
+                    raise ValueError(f"Unexpected output format from old_policy: {type(old_out)}")
 
-            # Parse results for logging
-            pred_values = []
-            parsed_cot = []
-            parsed_answer = []
-            for i, gen_text in enumerate(final_texts):
-                chain_of_thought, final_ans = prompt_manager.parse_cot_and_answer(gen_text)
-                guess = prompt_manager.extract_carbs_from_answer(final_ans)
-                pred_values.append(guess)
-                parsed_cot.append(chain_of_thought)
-                parsed_answer.append(final_ans)
+                # Ensure correct shape
+                if old_values.dim() == 3 and old_values.size(2) == 1:
+                    old_values = old_values.squeeze(-1)
 
-            # Debug prints
-            if accelerator and accelerator.is_main_process:
-                accelerator.print("\n----- Batch Predictions -----")
-                for i in range(len(b_q)):
-                    accelerator.print(f"Example {i+1}:")
-                    query_trunc = b_q[i][:50] + "..." if len(b_q[i]) > 50 else b_q[i]
-                    accelerator.print(f"  Query: {query_trunc}")
+                # 3) Compute old_logprobs from old_lm_logits
+                old_lp = compute_logprobs_from_logits(old_lm_logits[:, :-1, :], input_ids_padded[:, 1:])
+                # add a pad column
+                padcol = torch.zeros((old_lp.size(0), 1), device=old_lp.device, dtype=old_lp.dtype)
+                old_logprobs = torch.cat([old_lp, padcol], dim=1)
 
-                    cot_trunc = parsed_cot[i][:100] + "..." if len(parsed_cot[i]) > 100 else parsed_cot[i]
-                    accelerator.print(f"  Generated CoT: {cot_trunc}")
-                    accelerator.print(f"  Generated Answer: {parsed_answer[i]}")
-                    accelerator.print(f"  Pred={pred_values[i]}")
-                    accelerator.print(f"  True={b_a[i]}")
-                    accelerator.print(f"  Reward={reward_list[i]}")
-                    token_text = reward_token_info[i]["token_text"]
-                    token_indices = reward_token_info[i]["token_indices"]
-                    accelerator.print(f"  Reward assigned to: '{token_text}' at indices {token_indices}")
-                    accelerator.print("----------------------------")
+            # [B] Compute advantages & returns from the old values
+            advantages, returns = compute_gae_advantages(
+                rewards=reward_tensor,
+                values=old_values,
+                mask=attn_mask_padded * train_mask,
+                gamma=0.99,
+                lam=0.95
+            )
 
-            # Multiple PPO epochs
-            last_loss_dict = None
+            # [B.1] Advantage normalization (optional but often helpful):
+            with torch.no_grad():
+                valid_mask = (attn_mask_padded * train_mask) > 0
+                if valid_mask.any():
+                    adv_valid = advantages[valid_mask]
+                    mean_adv = adv_valid.mean()
+                    std_adv = adv_valid.std().clamp_min(1e-8)
+                    # Normalize in place
+                    advantages.sub_(mean_adv).div_(std_adv)
+
+            # [C] PPO epochs (multiple updates per batch)
             for ppo_epoch in range(args.ppo_epochs):
                 loss_dict = ppo_step(
-                    model=policy_value_model,
+                    model=policy_value_model,     # Use current policy for updates
                     optimizer=optimizer,
-                    old_logprobs=old_logprobs,
-                    old_values=old_values,
-                    input_ids=new_input_ids,
-                    attn_mask=new_attn_mask,
+                    old_logprobs=old_logprobs,    # just computed
+                    old_values=old_values,        # just computed
+                    input_ids=input_ids_padded,
+                    attn_mask=attn_mask_padded,
                     reward_tensor=reward_tensor,
                     train_mask=train_mask,
-                    ref_model=ref_base,
                     advantages=advantages,
-                    returns=returns_,
-                    cot_mask=cot_mask,
-                    kl_coef=args.kl_coef,
+                    returns=returns,
                     clip_range=args.clip_range,
-                    vf_coef=1.0,
-                    cot_kl_discount=args.cot_kl_discount,
-                    entropy_coef=args.entropy_coef
+                    vf_coef=args.vf_coef
                 )
+                
                 sched.step()
-                last_loss_dict = loss_dict
             global_step += 1
 
             accelerator.wait_for_everyone()
 
-            # Logging
-            if accelerator.is_main_process and wandb.run and last_loss_dict is not None:
+            # Comprehensive logging at the end of this batch
+            if accelerator.is_main_process and wandb.run and loss_dict is not None:
                 wandb.log({
                     "train/epoch": ep,
                     "train/step": global_step,
                     "train/avg_reward": avg_reward,
-                    "train/rolling_avg_reward": rolling_avg,
-                    "train/policy_loss": last_loss_dict["policy_loss"],
-                    "train/value_loss": last_loss_dict["value_loss"],
-                    "train/kl_value": last_loss_dict["kl_value"],
-                    "train/kl_loss": last_loss_dict["kl_loss"],
-                    "train/entropy": last_loss_dict["entropy"],
-                    "train/entropy_loss": last_loss_dict["entropy_loss"],
-                    "train/total_loss": last_loss_dict["total_loss"]
+                    "train/rolling_avg_reward": avg_pool_reward,
+                    "train/policy_loss": loss_dict["policy_loss"],
+                    "train/value_loss": loss_dict["value_loss"],
+                    "train/total_loss": loss_dict["total_loss"],
+                    "train/mean_ratio": loss_dict["mean_ratio"],
+                    "train/std_ratio": loss_dict["std_ratio"],
+                    "train/mean_advantage": loss_dict["mean_advantage"],
+                    "train/std_advantage": loss_dict["std_advantage"],
+                    "train/avg_kl": avg_kl
                 }, step=global_step)
+                
+                # Print summary with KL info
+                accelerator.print(f"  KL coefficient: {args.kl_coef:.6f}, Avg KL: {avg_kl:.6f}")
+                if avg_kl > 0.05:  # Arbitrary threshold
+                    accelerator.print("  ⚠️ WARNING: High KL divergence detected!")
 
-            # Optional checkpoint saving
-            if global_step % 200 == 0:
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    accelerator.print(f"Saving checkpoint at step={global_step}")
-                    unwrap = accelerator.unwrap_model(policy_value_model)
-                    ckdir = f"ppo_out/checkpoint_{global_step}"
-                    unwrap.base_model.save_pretrained(ckdir)
-                    tokenizer.save_pretrained(ckdir)
-                accelerator.wait_for_everyone()
+            # Save model periodically and when we get best reward
+            if accelerator.is_main_process:
+                # Check if we should save based on interval
+                save_by_interval = (global_step - last_save_step) >= save_interval
+                
+                # Check if we should save based on reward improvement
+                save_by_reward = avg_pool_reward > best_reward
+                
+                if save_by_interval or save_by_reward:
+                    # Create checkpoint directory
+                    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    
+                    # Get unwrapped model
+                    unwrapped_model = accelerator.unwrap_model(policy_value_model)
+                    
+                    # Save model
+                    accelerator.print(f"Saving checkpoint to {checkpoint_dir}")
+                    unwrapped_model.save_pretrained(checkpoint_dir)
+                    tokenizer.save_pretrained(checkpoint_dir)
+                    
+                    # Save optimizer state
+                    torch.save(optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
+                    
+                    # Save training state
+                    torch.save({
+                        "global_step": global_step,
+                        "rolling_avg_reward": avg_pool_reward,
+                        "best_reward": best_reward,
+                        "epoch": ep,
+                    }, os.path.join(checkpoint_dir, "training_state.pt"))
+                    
+                    # Update tracking variables
+                    last_save_step = global_step
+                    saved_checkpoints.append(checkpoint_dir)  # Add to saved list
+                    
+                    if save_by_reward:
+                        best_reward = avg_pool_reward
+                        # Mark this as best checkpoint with a symlink
+                        best_link = os.path.join(args.output_dir, "checkpoint-best")
+                        if os.path.exists(best_link):
+                            if os.path.islink(best_link):
+                                os.unlink(best_link)
+                            else:
+                                shutil.rmtree(best_link)
+                        # Create relative symlink
+                        os.symlink(os.path.basename(checkpoint_dir), best_link)
+                        accelerator.print(f"New best model with reward {best_reward:.4f}")
+                    
+                    # Cleanup old checkpoints, keeping only the most recent ones
+                    if len(saved_checkpoints) > max_checkpoints_to_keep:
+                        # Get the real path of the best checkpoint
+                        best_ckpt_path = None
+                        if os.path.exists(os.path.join(args.output_dir, "checkpoint-best")):
+                            best_ckpt_path = os.path.realpath(os.path.join(args.output_dir, "checkpoint-best"))
+                        
+                        # Sort checkpoints by creation time (oldest first)
+                        to_remove = saved_checkpoints[:-max_checkpoints_to_keep]
+                        
+                        for old_ckpt in to_remove:
+                            # Don't delete if it's the best checkpoint
+                            if best_ckpt_path and os.path.realpath(old_ckpt) == best_ckpt_path:
+                                accelerator.print(f"Keeping best checkpoint: {old_ckpt}")
+                                continue
+                            
+                            # Delete the old checkpoint
+                            accelerator.print(f"Removing old checkpoint: {old_ckpt}")
+                            if os.path.exists(old_ckpt):
+                                try:
+                                    shutil.rmtree(old_ckpt)
+                                except Exception as e:
+                                    accelerator.print(f"Error removing checkpoint {old_ckpt}: {e}")
+                        
+                        # Update our saved_checkpoints list, keeping only the ones we didn't delete
+                        saved_checkpoints = saved_checkpoints[-max_checkpoints_to_keep:]
 
-        accelerator.print(f"Epoch={ep} completed. Rolling avg reward={rolling_avg:.3f}")
+        accelerator.print(f"Epoch={ep} completed. Rolling avg reward={avg_pool_reward:.3f}")
 
     accelerator.print("Done PPO training!")
     accelerator.wait_for_everyone()
 
-    # Final save consistent with SFT saving approach
+    # Final model save
     if accelerator.is_main_process:
-        final_unwrap = accelerator.unwrap_model(policy_value_model)
-        accelerator.print(f"Saving final PPO model to {args.output_dir}")
-        final_unwrap.base_model.save_pretrained(args.output_dir)
+        accelerator.print(f"Training complete! Saving final model to {args.output_dir}")
+        final_model = accelerator.unwrap_model(policy_value_model)
+        final_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-
-        torch.save(final_unwrap.state_dict(), os.path.join(args.output_dir, "ppo_policy_value_model.pt"))
-        accelerator.print("All done! Check output in:", args.output_dir)
+        
+        # Save final training state
+        torch.save({
+            "global_step": global_step,
+            "rolling_avg_reward": avg_pool_reward,
+            "best_reward": best_reward,
+            "total_epochs": args.n_epochs,
+        }, os.path.join(args.output_dir, "final_training_state.pt"))
+        
+        accelerator.print(f"Final model saved. Best reward achieved: {best_reward:.4f}")
 
 
 if __name__ == "__main__":

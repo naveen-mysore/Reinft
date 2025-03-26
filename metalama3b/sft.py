@@ -80,56 +80,72 @@ class TrainingManager:
         # Load config
         print("Loading LLaMA config...")
         config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
-
-        # Disable caching
-        config.use_cache = False
+        config.use_cache = False  # Disable caching
 
         # Load model
         print("Loading LlamaForCausalLM model...")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
         self.model = LlamaForCausalLM.from_pretrained(
             "meta-llama/Llama-3.2-3B-Instruct",
             config=config,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32,
+            torch_dtype=dtype,
         )
         self.model.config.use_cache = False
         self.model.to(self.device)
 
+        # Print parameter counts
         param_count = sum(p.numel() for p in self.model.parameters())
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Total model params: {param_count}, Trainable: {trainable_count}")
 
         # Load tokenizer
         print("Loading LLaMA tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
-        # Some LLaMA-based checkpoints require setting use_fast=False:
-        # self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct", use_fast=False)
-        
-        # Set pad token to ensure proper padding functionality
+        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct", use_fast=False)
+
+        # For Llama, these tokens are typically built-in:
+        # <s>, </s>, [INST], [/INST]
+        # If you want to keep chain-of-thought tokens, add them:
+        special_tokens = {
+            "additional_special_tokens": [
+                "<|begin_cot|>", 
+                "<|end_cot|>"
+            ]
+        }
+        num_added = self.tokenizer.add_special_tokens(special_tokens)
+        print(f"Added {num_added} special tokens to the tokenizer vocabulary")
+
+        self.model.resize_token_embeddings(len(self.tokenizer))
+
+        # Ensure pad token and EOS token are defined
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-            self.tokenizer.padding_side = "left"  # This is typically preferred for causal LMs
+        self.tokenizer.padding_side = "left"
+
+        if self.tokenizer.eos_token_id is None:
+            # fallback
+            self.tokenizer.eos_token_id = self.tokenizer.pad_token_id
+
+        print(f"EOS token: {self.tokenizer.eos_token} (id: {self.tokenizer.eos_token_id})")
 
         return self.model, self.tokenizer
 
     def load_and_process_datasets(self, train_file, test_file, data_fraction):
-        """Load and preprocess the datasets with debug info."""
+        """Load and preprocess the datasets."""
         print("Loading datasets...")
 
-        # Helper function to load JSON as HF dataset
         def load_json_as_hf_dataset(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 data_list = json.load(f)
             return Dataset.from_list(data_list)
 
-        # Load datasets
         train_dataset = load_json_as_hf_dataset(train_file)
         test_dataset = load_json_as_hf_dataset(test_file)
 
-        # Shuffle datasets with random seeds
+        # Shuffle
         train_dataset = train_dataset.shuffle(seed=random.randint(1, 10000))
         test_dataset = test_dataset.shuffle(seed=random.randint(1, 10000))
 
-        # Apply data fraction if needed
+        # Fraction of data
         if data_fraction < 1.0:
             train_sz = int(len(train_dataset) * data_fraction)
             test_sz = int(len(test_dataset) * data_fraction)
@@ -139,91 +155,85 @@ class TrainingManager:
         else:
             print(f"Full data usage: train={len(train_dataset)}, test={len(test_dataset)}")
 
-        # Preprocess function
+        # Preprocessing
         def preprocess_function(batch):
-            questions = batch["question"]
-            # If 'answer_cot' is missing, fallback to empty
-            cots = batch.get("answer_cot", [""] * len(questions))
-            values = batch["answer_value"]
+            # Rename columns to expected ones if needed
+            questions = batch.get("question", batch.get("query", []))
+            cots = batch.get("answer_cot", batch.get("cot", [""] * len(questions)))
+            values = batch.get("answer_value", batch.get("answer", []))
 
             out_texts = []
             for q, cot, ans in zip(questions, cots, values):
                 text = self.prompt_manager.build_training_sample(
                     query=q,
-                    cot=cot,
-                    answer_value=ans,
-                    eos_token=self.tokenizer.eos_token or "<|endoftext|>"
+                    cot=cot, 
+                    answer_value=str(ans),
+                    eos_token=self.tokenizer.eos_token
                 )
+                # Safety check: ensure ends with EOS
+                if not text.endswith(self.tokenizer.eos_token):
+                    text += self.tokenizer.eos_token
+                    print("WARNING: Added missing EOS token to example")
+                    
                 out_texts.append(text)
 
             tokenized = self.tokenizer(
                 out_texts,
-                truncation=False,  # No truncation
-                padding=False  # No padding to max_length
+                truncation=False,
+                padding=False,
+                add_special_tokens=False
             )
+            
+            # Verify EOS tokens are present in a sample of examples
+            if random.random() < 0.01:  # Check ~1% of batches
+                for i in range(min(1, len(tokenized['input_ids']))):
+                    if tokenized['input_ids'][i][-1] != self.tokenizer.eos_token_id:
+                        print(f"WARNING: Example doesn't end with EOS: {tokenized['input_ids'][i][-5:]}")
+                        # Force add EOS token at the end if missing
+                        tokenized['input_ids'][i].append(self.tokenizer.eos_token_id)
+                        tokenized['attention_mask'][i].append(1)
+                        
             return tokenized
 
-        # Apply preprocessing
         print("Preprocessing train dataset...")
         train_dataset = train_dataset.map(preprocess_function, batched=True)
         print("Preprocessing test dataset...")
         test_dataset = test_dataset.map(preprocess_function, batched=True)
 
-        # Keep only necessary columns
+        # Keep only input_ids / attention_mask
         keep_cols = {"input_ids", "attention_mask"}
-        train_dataset = train_dataset.remove_columns(
-            [c for c in train_dataset.column_names if c not in keep_cols]
-        )
-        test_dataset = test_dataset.remove_columns(
-            [c for c in test_dataset.column_names if c not in keep_cols]
-        )
+        train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
+        test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
 
-        # Assign to self
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
 
-        # ---------------------------------------------------------------------
-        # Debugging Info: Print random samples from each dataset
-        # ---------------------------------------------------------------------
-        print("\n[DEBUG] Checking a few random training samples...")
+        # Debug prints
+        print("[DEBUG] Checking random training sample(s)...")
         if len(self.train_dataset) > 0:
-            for _ in range(2):
-                idx = random.randint(0, len(self.train_dataset) - 1)
-                sample = self.train_dataset[idx]
-                input_ids = sample["input_ids"]
-                decoded = self.tokenizer.decode(input_ids)
-                print(f"Train sample idx={idx}")
-                print(f"  Raw input_ids: {input_ids[:50]}... (len={len(input_ids)})")
-                print(f"  Decoded text : {decoded[:300]}...\n")
+            idx = random.randint(0, len(self.train_dataset) - 1)
+            sample = self.train_dataset[idx]
+            decoded = self.tokenizer.decode(sample["input_ids"][:512])
+            print(f"Train sample idx={idx}, decode[:512]:\n{decoded}\n")
         else:
-            print("  [WARNING] Train dataset is empty!")
+            print("WARNING: Train dataset is empty!")
 
-        print("[DEBUG] Checking a few random test samples...")
+        print("[DEBUG] Checking random test sample(s)...")
         if len(self.test_dataset) > 0:
-            for _ in range(2):
-                idx = random.randint(0, len(self.test_dataset) - 1)
-                sample = self.test_dataset[idx]
-                input_ids = sample["input_ids"]
-                decoded = self.tokenizer.decode(input_ids)
-                print(f"Test sample idx={idx}")
-                print(f"  Raw input_ids: {input_ids[:50]}... (len={len(input_ids)})")
-                print(f"  Decoded text : {decoded[:300]}...\n")
+            idx = random.randint(0, len(self.test_dataset) - 1)
+            sample = self.test_dataset[idx]
+            decoded = self.tokenizer.decode(sample["input_ids"][:512])
+            print(f"Test sample idx={idx}, decode[:512]:\n{decoded}\n")
         else:
-            print("  [WARNING] Test dataset is empty!")
+            print("WARNING: Test dataset is empty!")
 
-        # Quick average length check
-        avg_train_len = (
-            sum(len(self.train_dataset[i]["input_ids"]) for i in range(len(self.train_dataset)))
-            / len(self.train_dataset)
-            if len(self.train_dataset) > 0 else 0
-        )
-        avg_test_len = (
-            sum(len(self.test_dataset[i]["input_ids"]) for i in range(len(self.test_dataset)))
-            / len(self.test_dataset)
-            if len(self.test_dataset) > 0 else 0
-        )
-        print(f"[DEBUG] Average train sample length: {avg_train_len:.2f} tokens.")
-        print(f"[DEBUG] Average test sample length:  {avg_test_len:.2f} tokens.\n")
+        # Basic length stats
+        if len(self.train_dataset) > 0:
+            avg_len = sum(len(self.train_dataset[i]["input_ids"]) for i in range(len(self.train_dataset))) / len(self.train_dataset)
+            print(f"[DEBUG] Average train sample length: {avg_len:.2f} tokens.")
+        if len(self.test_dataset) > 0:
+            avg_len = sum(len(self.test_dataset[i]["input_ids"]) for i in range(len(self.test_dataset))) / len(self.test_dataset)
+            print(f"[DEBUG] Average test sample length: {avg_len:.2f} tokens.")
 
         return self.train_dataset, self.test_dataset
 
@@ -235,7 +245,8 @@ class TrainingManager:
         # Data collator
         data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
-            mlm=False
+            mlm=False,
+            pad_to_multiple_of=8
         )
 
         # Training arguments
@@ -265,6 +276,10 @@ class TrainingManager:
             data_collator=data_collator
         )
 
+        # Make sure the model config has proper knowledge of EOS
+        self.model.config.eos_token_id = self.tokenizer.eos_token_id
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
         return self.trainer
 
     def train(self):
@@ -286,6 +301,35 @@ class TrainingManager:
         self.tokenizer.save_pretrained(self.args.output_dir)
         print("All done! Check output in:", self.args.output_dir)
 
+    def prepare_data(self, df):
+        """
+        Prepare training data from a dataframe.
+        This method builds examples with proper EOS token handling.
+        """
+        examples = []
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Preparing examples"):
+            # Get the various fields
+            query = row.get('query', row.get('question', ''))
+            cot = row.get('cot', row.get('answer_cot', ''))  # May not exist in all datasets
+            answer = str(row.get('answer', row.get('answer_value', '')))
+            
+            # Build the training sample with explicit EOS token
+            sample = self.prompt_manager.build_training_sample(
+                query=query,
+                cot=cot,
+                answer_value=answer,
+                eos_token=self.tokenizer.eos_token  # Make sure to pass the correct EOS token
+            )
+            
+            # Safety check: ensure it ends with proper EOS token
+            if not sample.endswith(self.tokenizer.eos_token):
+                sample += self.tokenizer.eos_token
+                print(f"WARNING: Added missing EOS token to example {idx}")
+            
+            examples.append(sample)
+        
+        return examples
+
 
 ###############################################################################
 # 3) HELPER FUNCTIONS
@@ -294,8 +338,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_file", type=str, default="data/train_data.json")
     parser.add_argument("--test_file", type=str, default="data/test_data.json")
-    parser.add_argument("--output_dir", type=str, default="fine_tuned_model")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--output_dir", type=str, default="/data/nmysore/models/fine_tuned_model")
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=512)
