@@ -20,7 +20,7 @@ class PromptManager:
     def __init__(self):
         # System instructions: what the model should do globally
         self.system_instructions = (
-            "You are a nutrition assistant that calculates the total carbohydrates in any given food. When responding, break each item into its components, look up or estimate the carbs per serving for each component, and sum those values to find the total. Clearly explain how you arrived at that total by describing your step-by-step reasoning. Finally, present the total carbohydrate content inside angle brackets (e.g., <10> grams) and respond in the same language as the user's query.\n"
+            "You are a nutrition assistant that calculates the total carbohydrates in any given food. When responding, break each item into its components, look up or estimate the carbs per serving for each component, and sum those values to find the total. Clearly explain how you arrived at that total by describing your reasoning. Finally, present the total carbohydrate content inside angle brackets (e.g., <10> grams) and respond in the same language as the user's query.\n"
         )
 
     def build_prompt(self, query, mode="inference"):
@@ -55,10 +55,11 @@ class PromptManager:
         but if you want the chain of thought, you can still add it.
         """
         return (
-            f"<s>[INST] {self.system_instructions}\n"
+            f"<s>\n[INST]\n"
+            f"{self.system_instructions}\n"
             f"User: {user_query}\n"
             "[/INST]\n"
-            "Assistant:"
+            "Assistant:\n<|begin_cot|>\n"
         )
 
     def build_training_sample(
@@ -76,10 +77,11 @@ class PromptManager:
         """
         # Llama style system + user block
         prompt_prefix = (
-            f"<s>[INST] {self.system_instructions}\n"
+            f"<s>\n[INST]\n"
+            #f"{self.system_instructions}\n"
             f"User: {query}\n"
             "[/INST]\n"
-            "Assistant:<|begin_cot|>\n"
+            "Assistant:\n<|begin_cot|>\n"
         )
 
         # If chain-of-thought is empty, we still produce a minimal final answer
@@ -89,7 +91,7 @@ class PromptManager:
             final_cot += f" = <{answer_value.strip()}>"
 
         # Close chain-of-thought, then close the assistant block with </s> or EOS
-        prompt_suffix = "<|end_cot|>\n</s>"
+        prompt_suffix = "\n<|end_cot|>\n</s>"
 
         return prompt_prefix + final_cot + prompt_suffix + eos_token
 
@@ -141,8 +143,8 @@ class PromptManager:
             # no content => no answer
             return (chain_of_thought, "")
 
-        # gather last 2 tokens (or 1 if there's only 1)
-        last_tokens = tokens[-2:] if len(tokens) >= 2 else tokens[-1:]
+        # gather last 3 tokens (or 1 if there's only 1)
+        last_tokens = tokens[-3:] if len(tokens) >= 3 else tokens[-1:]
         snippet = " ".join(last_tokens)
         
         match = re.search(r"<([\-\d\.]+)>", snippet)

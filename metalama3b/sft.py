@@ -343,7 +343,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=512)
-    parser.add_argument("--data_fraction", type=float, default=0.2)
+    parser.add_argument("--data_fraction", type=float, default=0.01)
     parser.add_argument("--wandb_project", type=str, default="ppo_nutri_g3")
     parser.add_argument("--wandb_entity", type=str, default="nmysore-uc-santa-barbara")
     parser.add_argument("--wandb_run_name", type=str, default=None)

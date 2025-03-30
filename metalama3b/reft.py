@@ -43,71 +43,66 @@ def get_kl_penalty(
     attn_mask_padded,
     batch_lens,
     train_mask,
-    kl_coef,
-    cot_kl_discount
+    kl_coef=0.02,
 ):
     """
     Calculate KL divergence penalty between policy and reference model.
-    
-    Args:
-        policy_value_model: The current policy model
-        ref_base: Reference model used as KL target
-        input_ids_padded: Padded token IDs tensor [batch_size, seq_len]
-        attn_mask_padded: Attention mask tensor [batch_size, seq_len]
-        batch_lens: List of actual sequence lengths
-        train_mask: Mask indicating which tokens to train on [batch_size, seq_len]
-        kl_coef: KL penalty coefficient
-        cot_kl_discount: Discount factor for KL on chain-of-thought tokens
-        
-    Returns:
-        kl_penalty: Tensor of per-token KL penalties [batch_size, seq_len]
+    Applies a uniform KL coefficient across all tokens.
     """
-    batch_size = input_ids_padded.size(0)
-    kl_penalty = torch.zeros_like(input_ids_padded, dtype=torch.float, device=input_ids_padded.device)
+    if ref_base is None or kl_coef <= 0.0:
+        return torch.zeros_like(input_ids_padded, dtype=torch.float)
     
-    if ref_base is None or kl_coef <= 0:
-        return kl_penalty
-        
+    batch_size = input_ids_padded.size(0)
+    max_seq_len = input_ids_padded.size(1)
+    
+    # Initialize KL penalty tensor
+    kl_penalty = torch.zeros_like(input_ids_padded, dtype=torch.float)
+    
+    # Get logits from both models
     with torch.no_grad():
-        # Get policy logits
+        # Policy model logits
         policy_out = policy_value_model(
             input_ids=input_ids_padded,
             attention_mask=attn_mask_padded,
             use_cache=False
         )
-        policy_logits = policy_out.logits if hasattr(policy_out, 'logits') else policy_out[0]
+        if isinstance(policy_out, tuple) and len(policy_out) >= 2:
+            policy_logits = policy_out[0]
+        else:
+            policy_logits = policy_out.logits
         
-        # Get reference logits
+        # Reference model logits
         ref_out = ref_base(
             input_ids=input_ids_padded,
             attention_mask=attn_mask_padded,
             use_cache=False
         )
-        ref_logits = ref_out.logits if hasattr(ref_out, 'logits') else ref_out[0]
+        if isinstance(ref_out, tuple) and len(ref_out) >= 2:
+            ref_logits = ref_out[0]
+        else:
+            ref_logits = ref_out.logits
+    
+    # Calculate KL div token by token (only for tokens we train on)
+    for b in range(batch_size):
+        seq_len = batch_lens[b]
         
-        # Calculate log probabilities
-        policy_log_probs = F.log_softmax(policy_logits, dim=-1)
-        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-        
-        # Calculate KL for each token
-        for b in range(batch_size):
-            seq_len_b = batch_lens[b]
-            if seq_len_b <= 1:  # Skip if sequence is too short
+        for t in range(seq_len):
+            # Only apply KL penalty to tokens we're training on
+            if train_mask[b, t] == 0:
                 continue
+                
+            # Get logits for this position
+            p_logits = policy_logits[b, t]
+            r_logits = ref_logits[b, t]
             
-            for t in range(seq_len_b - 1):
-                token_next = input_ids_padded[b, t+1]
-                policy_lp = policy_log_probs[b, t, token_next]
-                ref_lp = ref_log_probs[b, t, token_next]
-                token_kl = policy_lp.exp() * (policy_lp - ref_lp)
-                
-                # Apply KL coefficient, possibly discounted for CoT tokens
-                kl_multiplier = kl_coef
-                if train_mask[b, t] > 0 and t < seq_len_b - 2:
-                    kl_multiplier = kl_coef * cot_kl_discount
-                
-                kl_penalty[b, t] = token_kl * kl_multiplier
-                
+            # Calculate KL div
+            p_log_softmax = F.log_softmax(p_logits, dim=-1)
+            r_softmax = F.softmax(r_logits, dim=-1)
+            token_kl = F.kl_div(p_log_softmax, r_softmax, reduction='sum')
+            
+            # Apply uniform KL coefficient
+            kl_penalty[b, t] = kl_coef * token_kl
+    
     return kl_penalty
 
 ###############################################################################
@@ -133,9 +128,9 @@ def compute_logprobs_from_logits(logits, labels):
 def gaussian_reward(
         pred_value: float,
         true_value: float,
-        sigma: float = 5.0,
+        sigma: float = 10.0,
         near_exact_range: float = 5.0,
-        near_exact_bonus: float = 20.0
+        near_exact_bonus: float = 1.0
 ):
     """
     Computes a reward in (0, +∞) based on a Gaussian decay from the ground truth.
@@ -155,7 +150,7 @@ def gaussian_reward(
     """
     diff = abs(pred_value - true_value)
     # Base Gaussian
-    base_reward = math.exp(-(diff ** 2) / (2.0 * sigma * sigma))
+    base_reward = 2 * math.exp(-(diff ** 2) / (2.0 * sigma * sigma))
 
     # near-exact bonus region
     if diff <= near_exact_range:
@@ -279,8 +274,6 @@ def rollout_step(
     temperature=1.0,
     do_sample=False,
     kl_coef=0.02,
-    cot_kl_discount=0.5,
-    step_reward=0.000001,
     ref_base=None
 ):
     """
@@ -365,10 +358,10 @@ def rollout_step(
         pred_values[i] = guess  # Use index assignment instead of append
         
         if guess is None or is_malformed:
-            numeric_reward = -5.0
+            numeric_reward = -1.0
         else:
             true_val = float(true_values[i])
-            numeric_reward = gaussian_reward(guess, true_val, sigma=5.0, near_exact_range=5.0, near_exact_bonus=40.0)
+            numeric_reward = gaussian_reward(guess, true_val, sigma=10.0, near_exact_range=5.0, near_exact_bonus=1.0)
             
         reward_list[i] = numeric_reward  # Use index assignment instead of append
         
@@ -400,16 +393,9 @@ def rollout_step(
             prompt_len = min(len(prompt_tokens), seq_len_b)
             if prompt_len < seq_len_b:
                 train_mask[b, prompt_len:seq_len_b] = 1.0
-                
-            # Only apply step reward if prediction was successful
-            if parsing_success[b] and pred_values[b] is not None:
-                reward_tensor[b, :seq_len_b] = step_reward
-            else:
-                # Zero step reward for malformed outputs
-                reward_tensor[b, :seq_len_b] = 0.0
             
             # Apply the main reward to the last token ONLY if sequence has length > 0
-            reward_tensor[b, seq_len_b-1] += reward_list[b]
+            reward_tensor[b, seq_len_b-1] = reward_list[b]
 
     # 6) Calculate KL penalty if reference model is provided
     kl_penalty = get_kl_penalty(
@@ -420,7 +406,6 @@ def rollout_step(
         batch_lens=batch_lens,
         train_mask=train_mask,
         kl_coef=kl_coef,
-        cot_kl_discount=cot_kl_discount
     )
     
     # Apply KL penalty to reward
@@ -573,13 +558,13 @@ def ppo_step(
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warm_start_model", type=str, default="/data/nmysore/models/fine_tuned_model",
+    parser.add_argument("--warm_start_model", type=str, default="/data/nmysore/models/fine_tuned_model_fd1e",
                         help="Path to your *fine-tuned* model checkpoint.")
     parser.add_argument("--train_file", type=str, required=True)
     parser.add_argument("--kl_coef", type=float, default=0.02)
     parser.add_argument("--lr", type=float, default=5e-7,
                         help="Learning rate for the policy network (default: 5e-6)")
-    parser.add_argument("--value_lr", type=float, default=1e-6,
+    parser.add_argument("--value_lr", type=float, default=1e-7,
                         help="Learning rate for the value head (default: 1e-6)")
     parser.add_argument("--n_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -589,14 +574,15 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="ppo_nutri_g3")
     parser.add_argument("--wandb_entity", type=str, default="nmysore-uc-santa-barbara")
     parser.add_argument("--max_new_tokens", type=int, default=400)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--start_temp", type=float, default=2.0,
+                        help="Starting temperature for the schedule")
+    parser.add_argument("--end_temp", type=float, default=0.2,
+                        help="Ending temperature for the schedule")
     parser.add_argument("--do_sample", action="store_true", default="True", help="Use sampling instead of greedy.")
     parser.add_argument("--ppo_epochs", type=int, default=3,
                         help="Number of PPO update epochs per batch")
     parser.add_argument("--clip_range", type=float, default=0.2,
                         help="PPO clip range parameter")
-    parser.add_argument("--cot_kl_discount", type=float, default=0.5,
-                        help="Discount factor for KL penalty on CoT tokens (0.0-1.0)")
     parser.add_argument("--output_dir", type=str, default="/data/nmysore/checkpoints/ppo_trained_model",
                         help="Where to store the final PPO model (so inference can load it).")
     parser.add_argument("--vf_coef", type=float, default=0.1,
@@ -774,16 +760,34 @@ def main():
     )
 
     global_step = 0
-    reward_deque = deque(maxlen=50)
+    reward_deque = deque(maxlen=100)
 
     # Initialize PromptManager
     prompt_manager = PromptManager()
 
+    # Calculate total steps for the temperature scheduler
+    steps_per_epoch = math.ceil(len(dataset) / args.batch_size)
+    max_steps = args.n_epochs * steps_per_epoch
+
     # 6) PPO
     for ep in range(args.n_epochs):
         random.shuffle(dataset)
-        steps_per_epoch = math.ceil(len(dataset) / args.batch_size)
         for step_i in range(steps_per_epoch):
+            # Compute the current global step
+            current_global_step = ep * steps_per_epoch + step_i
+            
+            # Get the current temperature based on schedule
+            current_temp = get_temperature(
+                current_step=current_global_step,
+                total_steps=max_steps,
+                start_temp=args.start_temp,
+                end_temp=args.end_temp
+            )
+            
+            # Log the temperature to wandb
+            if accelerator.is_main_process and wandb.run:
+                wandb.log({"train/temperature": current_temp}, step=current_global_step)
+            
             batch_slice = dataset[step_i * args.batch_size:(step_i + 1) * args.batch_size]
             if not batch_slice:
                 break
@@ -813,11 +817,9 @@ def main():
                 prompt_manager,
                 max_new_tokens=args.max_new_tokens,
                 accelerator=accelerator,  # Make sure to pass accelerator
-                temperature=args.temperature,
+                temperature=current_temp,  # Use the scheduled temperature
                 do_sample=args.do_sample,
                 kl_coef=args.kl_coef,
-                cot_kl_discount=args.cot_kl_discount,
-                step_reward=0.000001,
                 ref_base=ref_base
             )
 
@@ -848,7 +850,7 @@ def main():
             if accelerator.is_main_process:
                 # Print summary of batch results
                 success_rate = sum(parsing_success) / len(parsing_success) * 100
-                accelerator.print(f"\nBatch Summary - Step {global_step}:")
+                accelerator.print(f"\nBatch Summary - Step {current_global_step}:")
                 accelerator.print(f"  Parsing success rate: {success_rate:.1f}%")
                 accelerator.print(f"  Avg reward: {avg_reward:.4f} (rolling avg: {avg_pool_reward:.4f})")
                 
@@ -869,7 +871,7 @@ def main():
                             "reward": last_token_reward,  # Use the reward from reward_tensor
                             "parsing_success": parsing_success[i]
                         }
-                        wandb.log({f"examples/example_{i}": example}, step=global_step)
+                        wandb.log({f"examples/example_{i}": example}, step=current_global_step)
 
             # Get log probabilities and values from the old policy
             old_logprobs, old_values = get_log_probs_and_values(
@@ -919,6 +921,7 @@ def main():
                 policy_sched.step()
                 value_sched.step()
                 
+            # Update global step counter
             global_step += 1
 
             accelerator.wait_for_everyone()
@@ -927,7 +930,7 @@ def main():
             if accelerator.is_main_process and wandb.run and loss_dict is not None:
                 wandb.log({
                     "train/epoch": ep,
-                    "train/step": global_step,
+                    "train/step": current_global_step,
                     "train/avg_reward": avg_reward,
                     "train/rolling_avg_reward": avg_pool_reward,
                     "train/policy_loss": loss_dict["policy_loss"],
@@ -938,7 +941,7 @@ def main():
                     "train/mean_advantage": loss_dict["mean_advantage"],
                     "train/std_advantage": loss_dict["std_advantage"],
                     "train/avg_kl": avg_kl
-                }, step=global_step)
+                }, step=current_global_step)
                 
                 # Print summary with KL info
                 accelerator.print(f"  KL coefficient: {args.kl_coef:.6f}, Avg KL: {avg_kl:.6f}")
@@ -948,14 +951,14 @@ def main():
             # Save model periodically and when we get best reward
             if accelerator.is_main_process:
                 # Check if we should save based on interval
-                save_by_interval = (global_step - last_save_step) >= save_interval
+                save_by_interval = (current_global_step - last_save_step) >= save_interval
                 
                 # Check if we should save based on reward improvement
                 save_by_reward = avg_pool_reward > best_reward
                 
                 if save_by_interval or save_by_reward:
                     # Create checkpoint directory
-                    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{current_global_step}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
                     
                     # Get unwrapped model
@@ -972,14 +975,14 @@ def main():
                     
                     # Save training state
                     torch.save({
-                        "global_step": global_step,
+                        "global_step": current_global_step,
                         "rolling_avg_reward": avg_pool_reward,
                         "best_reward": best_reward,
                         "epoch": ep,
                     }, os.path.join(checkpoint_dir, "training_state.pt"))
                     
                     # Update tracking variables
-                    last_save_step = global_step
+                    last_save_step = current_global_step
                     saved_checkpoints.append(checkpoint_dir)  # Add to saved list
                     
                     if save_by_reward:
@@ -1086,6 +1089,31 @@ def get_log_probs_and_values(policy, input_ids, attention_mask, use_cache=False)
         )
         
     return logprobs, values
+
+def get_temperature(current_step, total_steps, start_temp=1.4, end_temp=0.8):
+    """
+    Linearly decay temperature from start_temp to end_temp 
+    as current_step goes from 0 to total_steps.
+
+    Args:
+        current_step: The current global step (integer)
+        total_steps: The maximum number of steps in your entire training
+        start_temp: Initial temperature at step=0
+        end_temp: Final temperature when step=total_steps
+    
+    Returns:
+        Current temperature value
+    """
+    # Ensure we don't divide by zero
+    if total_steps <= 1:
+        return start_temp
+        
+    # Cap the fraction between 0 and 1
+    fraction = min(max(float(current_step) / float(total_steps), 0.0), 1.0)
+    
+    # Linear interpolation
+    temp = start_temp + fraction * (end_temp - start_temp)
+    return temp
 
 if __name__ == "__main__":
     main()
