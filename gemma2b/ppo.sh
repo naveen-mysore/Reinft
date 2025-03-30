@@ -1,1 +1,0 @@
-nohup accelerate launch --num_processes=1 ppo.py --base_model_name google/gemma-2-2b-it --peft_checkpoint fine_tuned_model/checkpoint-9468/ --train_file data/ppo_train.json --data_fraction 0.1 --wandb_entity nmysore-uc-santa-barbara --wandb_project ppo_nutri_g2b &

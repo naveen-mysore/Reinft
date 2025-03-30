@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Inference Script updated to use LlamaForCausalLM (text-only approach),
-with a PromptManager for constructing the prompt.
+Inference Script updated to use LlamaForCausalLM with proper Llama-style prompts.
 """
 
 import torch
@@ -55,30 +54,47 @@ def load_model_and_tokenizer(model_path: str, use_bfloat16=True):
 ###############################################################################
 # 2) Generate a single response
 ###############################################################################
-def generate_response(model, tokenizer, user_prompt, max_new_tokens=200):
+def generate_response(model, tokenizer, prompt, max_new_tokens=200):
     """
-    Uses PromptManager to build the prompt for the user's meal query,
-    then calls .generate().
+    Generate a response using the model with a Llama-style prompt.
+    We do sample-based generation with temperature and top-p, and 
+    stop at the Llama eos_token_id (</s>).
     """
-    prompt_manager = PromptManager()
-    # Build the inference prompt (system + user instructions)
-    full_prompt = prompt_manager.build_inference_prompt(user_prompt)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    # Tokenize
-    inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    # Llama's eos token
+    eos_token_id = tokenizer.eos_token_id
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # Change to True if you want sampling
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=False
-        )
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,  
+        temperature=0.6,
+        top_p=0.9,
+        eos_token_id=eos_token_id, 
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
-    return tokenizer.decode(outputs[0], skip_special_tokens=False)
+    # Decode the entire generated text
+    response = tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+    # OPTIONAL: If you want to trim the text after "[/INST]" and "Assistant:",
+    # you can parse below. This logic looks for the first 'Assistant:' 
+    # after the last [/INST], then stops at </s>.
+    
+    inst_end = response.find("[/INST]")
+    if inst_end >= 0:
+        assistant_start = response.find("Assistant:", inst_end)
+        if assistant_start >= 0:
+            response_text = response[assistant_start:]
+            # Truncate at </s> if present
+            eos_pos = response_text.find("</s>")
+            if eos_pos >= 0:
+                response_text = response_text[:eos_pos]
+            return response_text
+    
+    # If we didn't find [INST] or "Assistant:", just return the full string
+    return response
 
 
 ###############################################################################
@@ -109,31 +125,33 @@ def main():
             print("Exiting...")
             break
 
-        # Generate raw text
+        # 1) Build a Llama-style prompt with system instructions + user query
+        prompt = prompt_manager.build_inference_prompt(user_input)
+
+        # 2) Generate raw text
         raw_output = generate_response(
             model=model,
             tokenizer=tokenizer,
-            user_prompt=user_input,
+            prompt=prompt,
             max_new_tokens=args.max_new_tokens
         )
         print("Raw output:\n")
         print(raw_output)
         print("\n")
 
-        # Now parse the CoT and final answer
+        # 3) Parse the CoT and final answer 
         model_block = prompt_manager.extract_model_block(raw_output)
-        chain_of_thought, final_answer = prompt_manager.parse_cot_and_answer(raw_output)
+        chain_of_thought, final_answer = prompt_manager.parse_cot_and_answer(model_block)
         carbs_value = prompt_manager.extract_carbs_from_answer(final_answer)
 
         print("\n--- Full Model Block ---")
-        # In the new LLaMA prompt style, you may not have <start_of_turn> or <end_of_turn> anymore.
         print(model_block if model_block else "[No specialized block markers found]")
 
-        print("\n--- Parsed Chain-of-Thought (<cot>...</cot>) ---")
-        print(chain_of_thought if chain_of_thought else "[No <cot> found]")
+        print("\n--- Parsed Chain-of-Thought ---")
+        print(chain_of_thought if chain_of_thought else "[No reasoning found]")
 
-        print("\n--- Parsed Final Answer (<answer>...</answer>) ---")
-        print(final_answer if final_answer else "[No <answer> found]")
+        print("\n--- Parsed Final Answer ---")
+        print(final_answer if final_answer else "[No answer found]")
 
         print("\n--- Extracted Carbohydrate Value ---")
         print(f"{carbs_value} g" if carbs_value is not None else "[No carb value found]")
