@@ -33,368 +33,6 @@ from src.ppo.policy_value import PolicyValueModelWrapper
 from src.prompt_manager import PromptManager
 from src.ppo.ppo_trainer import PPOTrainer
 
-def compute_normalized_gae_advantages(rewards, values, gamma=0.99, lam=0.95, mask=None):
-    """
-    Compute Generalized Advantage Estimation across token sequences with normalization.
-    
-    Args:
-        rewards: Tensor of shape [batch_size, seq_len] with rewards
-        values: Tensor of shape [batch_size, seq_len] with value predictions
-        gamma: Discount factor
-        lam: GAE lambda parameter
-        mask: Optional attention mask to identify valid tokens
-    
-    Returns:
-        advantages: Tensor of shape [batch_size, seq_len], normalized to mean=0, std=1
-        returns: Tensor of shape [batch_size, seq_len]
-    """
-    batch_size = rewards.size(0)
-    seq_len = rewards.size(1)
-    
-    # Create a proper mask if none is provided
-    if mask is None:
-        mask = torch.ones_like(rewards)
-    else:
-        # Ensure mask has the same shape as rewards and values
-        if mask.size(1) != seq_len:
-            # Create a new mask with the same shape as rewards
-            new_mask = torch.zeros_like(rewards)
-            # Copy over the values from the original mask, up to its length
-            for b in range(batch_size):
-                mask_len = min(mask.size(1), seq_len)
-                new_mask[b, :mask_len] = mask[b, :mask_len]
-            mask = new_mask
-    
-    advantages = torch.zeros_like(rewards)
-    returns = torch.zeros_like(rewards)
-    
-    # Process each batch item separately
-    for b in range(batch_size):
-        # Process tokens in reverse order for GAE calculation
-        gae = 0
-        for t in reversed(range(seq_len)):
-            # Skip if this token is masked out
-            if mask[b, t] == 0:
-                continue
-                
-            # For last token or if next token is masked, bootstrap is 0
-            if t == seq_len - 1 or mask[b, t+1] == 0:
-                next_value = 0
-            else:
-                next_value = values[b, t+1]
-            
-            # GAE calculation formula
-            delta = rewards[b, t] + gamma * next_value - values[b, t]
-            gae = delta + gamma * lam * gae
-            
-            # Store results
-            advantages[b, t] = gae
-            returns[b, t] = gae + values[b, t]
-    
-    # Normalize advantages to have zero mean and unit variance
-    with torch.no_grad():
-        valid_mask = mask > 0
-        if valid_mask.any():
-            adv_valid = advantages[valid_mask]
-            mean_adv = adv_valid.mean()
-            std_adv = adv_valid.std().clamp_min(1e-8)
-            # Normalize in place
-            advantages = (advantages - mean_adv) / std_adv
-    
-    return advantages, returns
-
-###############################################################################
-# 5) MAIN
-###############################################################################
-def main(args):
-    """
-    Main PPO training function.
-    
-    Args:
-        args: Parsed command line arguments
-    """
-    global_step = 0
-    reward_deque = deque(maxlen=100)
-    best_reward = -float('inf')
-    last_save_step = 0
-    save_interval = 100  # Save every 100 steps
-    saved_checkpoints = []  # List to track saved checkpoints
-    max_checkpoints_to_keep = 2  # Keep only 2 latest checkpoints
-    
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-    prompt_manager = PromptManager()
-
-    # set seed
-    random.seed(args.seed + accelerator.process_index)
-    np.random.seed(args.seed + accelerator.process_index)
-    torch.manual_seed(args.seed + accelerator.process_index)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed + accelerator.process_index)
-
-    if accelerator.is_main_process:
-        if args.wandb_project:
-            wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                config=vars(args)
-            )
-        
-        # Setup output directory
-        os.makedirs(args.output_dir, exist_ok=True)
-        
-        # Save args for future reference
-        args_file = os.path.join(args.output_dir, "training_args.json")
-        with open(args_file, "w") as f:
-            json.dump(vars(args), f, indent=2)
-        
-        accelerator.print(f"Arguments saved to {args_file}")
-
-    # Load dataset with separate function
-    dataset = load_dataset(
-        file_path=args.train_file,
-        data_fraction=args.data_fraction,
-        accelerator=accelerator
-    )
-
-    accelerator.print("Loading reference model from the same checkpoint")
-
-    # Create the new BaseModel and freeze it
-    base_model = BaseModel(
-        warm_start_model=args.warm_start_model,
-        base_model_name=args.base_model_name,
-        accelerator=accelerator
-    )
-    base_model.freeze()
-    ref_base = base_model.model
-
-    accelerator.print("Loading policy_value_model as TRL AutoModelForCausalLMWithValueHead")
-    policy_wrapper = PolicyValueModelWrapper(
-        warm_start_model=args.warm_start_model,
-        base_model_name=args.base_model_name,
-        accelerator=accelerator
-    )
-    policy_wrapper.freeze_except_last_n_layers(n=2)
-    policy_value_model = policy_wrapper.model
-
-    # Wrap for DDP
-    policy_value_model, ref_base = accelerator.prepare(policy_value_model, ref_base)
-    
-
-    # Setup tokenizer with a separate function
-    tokenizer = setup_tokenizer(
-        warm_start_model=args.warm_start_model,
-        models=[ref_base, policy_value_model],
-        accelerator=accelerator
-    )
-
-    # 5) optimizer
-    # Split parameters into policy and value groups
-    policy_params = []
-    value_params = []
-    
-    for name, param in policy_value_model.named_parameters():
-        if "v_head" in name or "value_head" in name:
-            value_params.append(param)
-        else:
-            policy_params.append(param)
-    
-    # Create separate optimizers
-    policy_optimizer = torch.optim.AdamW(policy_params, lr=args.lr)
-    value_optimizer = torch.optim.AdamW(value_params, lr=args.value_lr)
-    
-    # Separate schedulers for policy and value optimizers
-    policy_sched = get_constant_schedule_with_warmup(policy_optimizer, num_warmup_steps=0)
-    # Linear schedule with warmup for value head
-    value_sched = get_linear_schedule_with_warmup(
-        value_optimizer, 
-        num_warmup_steps=100,  # Adjust this as needed
-        num_training_steps=len(dataset) // args.batch_size * args.n_epochs
-    )
-
-    # Calculate total steps for the temperature scheduler
-    steps_per_epoch = math.ceil(len(dataset) / args.batch_size)
-    max_steps = args.n_epochs * steps_per_epoch
-
-    ppo_config = {
-        "clip_range": args.clip_range,
-        "vf_coef": args.vf_coef,
-        "gamma": 0.99,
-        "lam": 0.95,
-        # Add anything else you need
-    }
-    ppo_trainer = PPOTrainer(
-        policy_model=policy_value_model,
-        ref_model=ref_base,
-        policy_optimizer=policy_optimizer,
-        value_optimizer=value_optimizer,
-        config=ppo_config
-    )
-
-    # 6) PPO
-    for ep in range(args.n_epochs):
-        random.shuffle(dataset)
-        for step_i in range(steps_per_epoch):
-            # Compute the current global step
-            current_global_step = ep * steps_per_epoch + step_i
-            
-            # Get the current temperature based on schedule
-            current_temp = get_temperature(
-                current_step=current_global_step,
-                total_steps=max_steps,
-                start_temp=args.start_temp,
-                end_temp=args.end_temp
-            )
-            
-            # Log the temperature to wandb
-            if accelerator.is_main_process and wandb.run:
-                wandb.log({"train/temperature": current_temp}, step=current_global_step)
-            
-            batch_slice = dataset[step_i * args.batch_size:(step_i + 1) * args.batch_size]
-            if not batch_slice:
-                break
-            b_q = [x[0] for x in batch_slice]
-            b_a = [x[1] for x in batch_slice]
-
-            # Create a frozen copy of the current policy to serve as old policy
-            old_policy = copy.deepcopy(policy_value_model).eval()
-
-            # Roll out with old policy using the method from PPOTrainer
-            (
-                input_ids_padded,
-                attn_mask_padded,
-                train_mask,
-                reward_tensor,
-                final_texts,
-                pred_values,
-                parsing_success,
-                kl_penalty
-            ) = ppo_trainer.rollout_step(
-                ref_base=ref_base,
-                policy_value_model=old_policy,
-                tokenizer=tokenizer,
-                prompts=b_q,
-                true_values=b_a,
-                prompt_manager=prompt_manager,
-                max_new_tokens=args.max_new_tokens,
-                accelerator=accelerator,
-                temperature=current_temp,
-                do_sample=args.do_sample,
-                kl_coef=args.kl_coef,
-            )
-
-            # Get log probabilities and values from the old policy
-            old_logprobs, old_values = get_log_probs_and_values(
-                policy=old_policy,
-                input_ids=input_ids_padded,
-                attention_mask=attn_mask_padded,
-                use_cache=False
-            )
-
-            # Compute advantages & returns from the old values
-            advantages, returns = compute_normalized_gae_advantages(
-                rewards=reward_tensor,
-                values=old_values,
-                mask=attn_mask_padded * train_mask,
-                gamma=0.99,
-                lam=0.95
-            )
-
-            # Calculate reward statistics
-            avg_reward, avg_kl, avg_pool_reward = calculate_reward_statistics(
-                reward_tensor=reward_tensor,
-                attn_mask_padded=attn_mask_padded,
-                kl_penalty=kl_penalty,
-                reward_deque=reward_deque
-            )
-            
-            # Log batch results
-            log_batch_results(
-                accelerator=accelerator,
-                wandb_run=wandb.run if accelerator.is_main_process else None,
-                current_global_step=current_global_step,
-                parsing_success=parsing_success,
-                avg_reward=avg_reward,
-                avg_pool_reward=avg_pool_reward,
-                final_texts=final_texts,
-                b_q=b_q,
-                b_a=b_a,
-                pred_values=pred_values,
-                reward_tensor=reward_tensor,
-                attn_mask_padded=attn_mask_padded
-            )
-
-            # PPO epochs (multiple updates per batch)
-            for _ in range(args.ppo_epochs):
-                loss_dict = ppo_trainer.ppo_step(
-                    model=policy_value_model,
-                    policy_optimizer=policy_optimizer,
-                    value_optimizer=value_optimizer,
-                    old_logprobs=old_logprobs,
-                    old_values=old_values,
-                    input_ids=input_ids_padded,
-                    attn_mask=attn_mask_padded,
-                    train_mask=train_mask,
-                    advantages=advantages,
-                    returns=returns,
-                    clip_range=args.clip_range,
-                    vf_coef=args.vf_coef
-                )
-                
-                # Step both schedulers
-                policy_sched.step()
-                value_sched.step()
-                
-            # Update global step counter
-            global_step += 1
-
-            accelerator.wait_for_everyone()
-
-            # Handle logging and checkpoint saving
-            best_reward, last_save_step, saved_checkpoints = log_and_save_checkpoints(
-                accelerator=accelerator,
-                wandb_run=wandb.run if accelerator.is_main_process else None,
-                ep=ep,
-                current_global_step=current_global_step,
-                avg_reward=avg_reward,
-                avg_pool_reward=avg_pool_reward,
-                loss_dict=loss_dict,
-                avg_kl=avg_kl,
-                kl_coef=args.kl_coef,
-                policy_value_model=policy_value_model,
-                tokenizer=tokenizer,
-                policy_optimizer=policy_optimizer,
-                value_optimizer=value_optimizer,
-                best_reward=best_reward,
-                last_save_step=last_save_step,
-                save_interval=save_interval,
-                saved_checkpoints=saved_checkpoints,
-                max_checkpoints_to_keep=max_checkpoints_to_keep,
-                output_dir=args.output_dir
-            )
-
-        accelerator.print(f"Epoch={ep} completed. Rolling avg reward={avg_pool_reward:.3f}")
-
-    accelerator.print("Done PPO training!")
-    accelerator.wait_for_everyone()
-
-    # Final model save
-    if accelerator.is_main_process:
-        accelerator.print(f"Training complete! Saving final model to {args.output_dir}")
-        final_model = accelerator.unwrap_model(policy_value_model)
-        final_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        
-        # Save final training state
-        torch.save({
-            "global_step": global_step,
-            "rolling_avg_reward": avg_pool_reward,
-            "best_reward": best_reward,
-            "total_epochs": args.n_epochs,
-        }, os.path.join(args.output_dir, "final_training_state.pt"))
-        
-        accelerator.print(f"Final model saved. Best reward achieved: {best_reward:.4f}")
-
 def get_log_probs_and_values(policy, input_ids, attention_mask, use_cache=False):
     """
     Perform a forward pass with a policy model and extract log probabilities and values.
@@ -436,31 +74,6 @@ def get_log_probs_and_values(policy, input_ids, attention_mask, use_cache=False)
         logprobs = torch.gather(log_probs, dim=-1, index=labels_flat).squeeze(-1)
         
     return logprobs, values
-
-def get_temperature(current_step, total_steps, start_temp=1.4, end_temp=0.8):
-    """
-    Linearly decay temperature from start_temp to end_temp 
-    as current_step goes from 0 to total_steps.
-
-    Args:
-        current_step: The current global step (integer)
-        total_steps: The maximum number of steps in your entire training
-        start_temp: Initial temperature at step=0
-        end_temp: Final temperature when step=total_steps
-    
-    Returns:
-        Current temperature value
-    """
-    # Ensure we don't divide by zero
-    if total_steps <= 1:
-        return start_temp
-        
-    # Cap the fraction between 0 and 1
-    fraction = min(max(float(current_step) / float(total_steps), 0.0), 1.0)
-    
-    # Linear interpolation
-    temp = start_temp + fraction * (end_temp - start_temp)
-    return temp
 
 def load_dataset(file_path, data_fraction=1.0, accelerator=None):
     """
@@ -753,7 +366,8 @@ def log_batch_results(
     b_a,
     pred_values,
     reward_tensor,
-    attn_mask_padded
+    attn_mask_padded,
+    temperature=None  # Add temperature parameter
 ):
     """
     Log detailed batch results including statistics and examples to wandb.
@@ -771,6 +385,7 @@ def log_batch_results(
         pred_values: Predicted values from the model
         reward_tensor: Tensor containing rewards [batch_size, seq_len]
         attn_mask_padded: Attention mask to determine sequence lengths
+        temperature: Current temperature value for generation (optional)
     """
     # Only log if this is the main process
     if not accelerator.is_main_process:
@@ -782,8 +397,15 @@ def log_batch_results(
     accelerator.print(f"  Parsing success rate: {success_rate:.1f}%")
     accelerator.print(f"  Avg reward: {avg_reward:.4f} (rolling avg: {avg_pool_reward:.4f})")
     
-    # Log some examples to wandb if enabled
+    if temperature is not None:
+        accelerator.print(f"  Temperature: {temperature:.4f}")
+    
+    # Log to wandb if enabled
     if wandb_run:
+        # Log temperature if provided
+        if temperature is not None:
+            wandb_run.log({"train/temperature": temperature}, step=current_global_step)
+        
         # Log a few examples with their parsed values
         log_samples = min(3, len(final_texts))
         for i in range(log_samples):
@@ -800,6 +422,255 @@ def log_batch_results(
                 "parsing_success": parsing_success[i]
             }
             wandb_run.log({f"examples/example_{i}": example}, step=current_global_step)
+
+###############################################################################
+# 5) MAIN
+###############################################################################
+def main(args):
+    """
+    Main PPO training function.
+    
+    Args:
+        args: Parsed command line arguments
+    """
+    global_step = 0
+    reward_deque = deque(maxlen=100)
+    best_reward = -float('inf')
+    last_save_step = 0
+    save_interval = 100  # Save every 100 steps
+    saved_checkpoints = []  # List to track saved checkpoints
+    max_checkpoints_to_keep = 2  # Keep only 2 latest checkpoints
+    
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    prompt_manager = PromptManager()
+
+    # set seed
+    random.seed(args.seed + accelerator.process_index)
+    np.random.seed(args.seed + accelerator.process_index)
+    torch.manual_seed(args.seed + accelerator.process_index)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + accelerator.process_index)
+
+    if accelerator.is_main_process:
+        if args.wandb_project:
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                config=vars(args)
+            )
+        
+        # Setup output directory
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Save args for future reference
+        args_file = os.path.join(args.output_dir, "training_args.json")
+        with open(args_file, "w") as f:
+            json.dump(vars(args), f, indent=2)
+        
+        accelerator.print(f"Arguments saved to {args_file}")
+
+    # Load dataset with separate function
+    dataset = load_dataset(
+        file_path=args.train_file,
+        data_fraction=args.data_fraction,
+        accelerator=accelerator
+    )
+
+    accelerator.print("Loading reference model from the same checkpoint")
+
+    # Create the new BaseModel and freeze it
+    base_model = BaseModel(
+        warm_start_model=args.warm_start_model,
+        base_model_name=args.base_model_name,
+        accelerator=accelerator
+    )
+    base_model.freeze()
+    ref_base = base_model.model
+
+    accelerator.print("Loading policy_value_model as TRL AutoModelForCausalLMWithValueHead")
+    policy_wrapper = PolicyValueModelWrapper(
+        warm_start_model=args.warm_start_model,
+        base_model_name=args.base_model_name,
+        accelerator=accelerator
+    )
+    policy_wrapper.freeze_except_last_n_layers(n=2)
+    policy_value_model = policy_wrapper.model
+
+    # Wrap for DDP
+    policy_value_model, ref_base = accelerator.prepare(policy_value_model, ref_base)
+    
+
+    # Setup tokenizer with a separate function
+    tokenizer = setup_tokenizer(
+        warm_start_model=args.warm_start_model,
+        models=[ref_base, policy_value_model],
+        accelerator=accelerator
+    )
+
+    # 5) optimizer
+    # Split parameters into policy and value groups
+    policy_params = []
+    value_params = []
+    
+    for name, param in policy_value_model.named_parameters():
+        if "v_head" in name or "value_head" in name:
+            value_params.append(param)
+        else:
+            policy_params.append(param)
+    
+    # Create separate optimizers
+    policy_optimizer = torch.optim.AdamW(policy_params, lr=args.lr)
+    value_optimizer = torch.optim.AdamW(value_params, lr=args.value_lr)
+    
+    # Separate schedulers for policy and value optimizers
+    policy_sched = get_constant_schedule_with_warmup(policy_optimizer, num_warmup_steps=0)
+    # Linear schedule with warmup for value head
+    value_sched = get_linear_schedule_with_warmup(
+        value_optimizer, 
+        num_warmup_steps=100,  # Adjust this as needed
+        num_training_steps=len(dataset) // args.batch_size * args.n_epochs
+    )
+
+    # Calculate total steps for the temperature scheduler
+    steps_per_epoch = math.ceil(len(dataset) / args.batch_size)
+    max_steps = args.n_epochs * steps_per_epoch
+
+    ppo_config = {
+        "clip_range": args.clip_range,
+        "vf_coef": args.vf_coef,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "do_sample": args.do_sample,
+        "kl_coef": args.kl_coef,
+        "max_new_tokens": args.max_new_tokens
+    }
+    ppo_trainer = PPOTrainer(
+        policy_model=policy_value_model,
+        ref_model=ref_base,
+        policy_optimizer=policy_optimizer,
+        value_optimizer=value_optimizer,
+        config=ppo_config,
+        accelerator=accelerator
+    )
+    
+    # Initialize temperature scheduler
+    ppo_trainer.set_temperature(
+        start_temp=args.start_temp,
+        end_temp=args.end_temp,
+        total_steps=max_steps
+    )
+
+    # 6) PPO
+    for ep in range(args.n_epochs):
+        random.shuffle(dataset)
+        for step_i in range(steps_per_epoch):
+            # Compute the current global step
+            current_global_step = ep * steps_per_epoch + step_i
+            
+            # Prepare batch
+            batch_slice = dataset[step_i * args.batch_size:(step_i + 1) * args.batch_size]
+            if not batch_slice:
+                break
+            b_q, b_a = zip(*batch_slice)
+
+            # Create a frozen copy of the current policy to serve as old policy
+            old_policy = copy.deepcopy(policy_value_model).eval()
+
+            # Call the improved rollout_step with additional parameters
+            (
+                input_ids_padded,
+                attn_mask_padded,
+                train_mask,
+                advantages,
+                returns,
+                old_logprobs,
+                old_values,
+                avg_reward,
+                avg_kl,
+                avg_pool_reward
+            ) = ppo_trainer.rollout_step(
+                ref_base=ref_base,
+                policy_value_model=old_policy,
+                tokenizer=tokenizer,
+                prompts=b_q,
+                true_values=b_a,
+                reward_deque=reward_deque,
+                current_global_step=current_global_step,
+                wandb_run=wandb.run if accelerator.is_main_process else None
+            )
+
+            # PPO epochs (multiple updates per batch)
+            for _ in range(args.ppo_epochs):
+                loss_dict = ppo_trainer.ppo_step(
+                    model=policy_value_model,
+                    policy_optimizer=policy_optimizer,
+                    value_optimizer=value_optimizer,
+                    old_logprobs=old_logprobs,
+                    old_values=old_values,
+                    input_ids=input_ids_padded,
+                    attn_mask=attn_mask_padded,
+                    train_mask=train_mask,
+                    advantages=advantages,
+                    returns=returns,
+                    clip_range=args.clip_range,
+                    vf_coef=args.vf_coef
+                )
+                
+                # Step both schedulers
+                policy_sched.step()
+                value_sched.step()
+                
+            # Update global step counter and temperature step
+            global_step += 1
+            ppo_trainer.update_step()
+
+            accelerator.wait_for_everyone()
+
+            # Handle logging and checkpoint saving
+            best_reward, last_save_step, saved_checkpoints = log_and_save_checkpoints(
+                accelerator=accelerator,
+                wandb_run=wandb.run if accelerator.is_main_process else None,
+                ep=ep,
+                current_global_step=current_global_step,
+                avg_reward=avg_reward,
+                avg_pool_reward=avg_pool_reward,
+                loss_dict=loss_dict,
+                avg_kl=avg_kl,
+                kl_coef=args.kl_coef,
+                policy_value_model=policy_value_model,
+                tokenizer=tokenizer,
+                policy_optimizer=policy_optimizer,
+                value_optimizer=value_optimizer,
+                best_reward=best_reward,
+                last_save_step=last_save_step,
+                save_interval=save_interval,
+                saved_checkpoints=saved_checkpoints,
+                max_checkpoints_to_keep=max_checkpoints_to_keep,
+                output_dir=args.output_dir
+            )
+
+        accelerator.print(f"Epoch={ep} completed. Rolling avg reward={avg_pool_reward:.3f}")
+
+    accelerator.print("Done PPO training!")
+    accelerator.wait_for_everyone()
+
+    # Final model save
+    if accelerator.is_main_process:
+        accelerator.print(f"Training complete! Saving final model to {args.output_dir}")
+        final_model = accelerator.unwrap_model(policy_value_model)
+        final_model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        
+        # Save final training state
+        torch.save({
+            "global_step": global_step,
+            "rolling_avg_reward": avg_pool_reward,
+            "best_reward": best_reward,
+            "total_epochs": args.n_epochs,
+        }, os.path.join(args.output_dir, "final_training_state.pt"))
+        
+        accelerator.print(f"Final model saved. Best reward achieved: {best_reward:.4f}")
 
 if __name__ == "__main__":
     # Move argument parsing here
@@ -823,10 +694,6 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="ppo_nutri_g3")
     parser.add_argument("--wandb_entity", type=str, default="nmysore-uc-santa-barbara")
     parser.add_argument("--max_new_tokens", type=int, default=400)
-    parser.add_argument("--start_temp", type=float, default=2.0,
-                        help="Starting temperature for the schedule")
-    parser.add_argument("--end_temp", type=float, default=0.2,
-                        help="Ending temperature for the schedule")
     parser.add_argument("--do_sample", action="store_true", default="True", help="Use sampling instead of greedy.")
     parser.add_argument("--ppo_epochs", type=int, default=3,
                         help="Number of PPO update epochs per batch")
@@ -836,6 +703,10 @@ if __name__ == "__main__":
                         help="Where to store the final PPO model (so inference can load it).")
     parser.add_argument("--vf_coef", type=float, default=0.1,
                         help="Value function coefficient for PPO")
+    parser.add_argument("--start_temp", type=float, default=1.4,
+                        help="Starting temperature for temperature scheduling")
+    parser.add_argument("--end_temp", type=float, default=0.8,
+                        help="Ending temperature for temperature scheduling")
     args = parser.parse_args()
     
     # Call main with the parsed arguments
