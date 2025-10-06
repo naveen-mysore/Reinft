@@ -11,7 +11,8 @@ This project fine-tunes a text-only LLM in two stages:
 
 The repo includes GPT-2 and LLaMA-style pipelines, left-padding for decoder-only models, and robust tokenizer handling for special CoT markers: `<|begin_cot|>` … `<|end_cot|>`.
 
-![Demo](media/demo.gif){ .image25percent }
+This demo shows improved reasoning paths and ability to handle multiple languages post training.
+![Demo](media/demo.gif)
 
 ## 2) Quickstart (TL;DR)
 ```bash
